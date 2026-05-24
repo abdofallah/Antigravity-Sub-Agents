@@ -25,7 +25,7 @@ import * as path from 'path';
 import * as fs from 'fs';
 import { AntigravitySDK, Models } from 'antigravity-sdk';
 import { Orchestrator } from './orchestrator';
-import { ActiveTreeProvider, HistoryTreeProvider } from './tree-provider';
+import { ActiveTreeProvider, HistoryTreeProvider, StatusTreeProvider, McpServerHealth } from './tree-provider';
 import { StatusBarWidget } from './status-bar';
 import { NotificationManager } from './notifications';
 import { McpBridge } from './mcp-bridge';
@@ -36,6 +36,14 @@ let sdk: AntigravitySDK;
 let orchestrator: Orchestrator;
 let mcpBridge: McpBridge;
 let cdpInjector: CdpSidebarInjector;
+let _out: vscode.OutputChannel | null = null;
+
+/** Log to the Sub-Agents output channel */
+function log(msg: string): void {
+    const line = `[${new Date().toISOString()}] ${msg}`;
+    console.log(line);
+    _out?.appendLine(line);
+}
 
 // ─── Settings Helpers ──────────────────────────────────────────────────
 
@@ -63,15 +71,18 @@ function getCdpPort(): number {
 }
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
-    console.log('[SubAgents] Activating...');
+    // ─── Output Channel ──────────────────────────────────────────
+    _out = vscode.window.createOutputChannel('Sub-Agents');
+    context.subscriptions.push(_out);
+    log('Activating Sub-Agents extension...');
 
     // ─── Initialize SDK ─────────────────────────────────────────────
     try {
         sdk = new AntigravitySDK(context);
         await sdk.initialize();
-        console.log('[SubAgents] SDK initialized');
+        log('SDK initialized');
     } catch (err: any) {
-        console.error('[SubAgents] SDK init failed:', err.message);
+        log(`SDK init failed: ${err.message}`);
         vscode.window.showErrorMessage(
             `Sub-Agents: Failed to initialize Antigravity SDK — ${err.message}. `
             + 'Make sure you are running inside Antigravity IDE.',
@@ -79,13 +90,16 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         return;
     }
 
-    // ─── Initialize LS Bridge ───────────────────────────────────────
+    // ─── Initialize LS Bridge ─────────────────────────────────────
     if (!sdk.ls.isReady) {
+        log('LS Bridge not ready — will retry. Sub-agent creation may not work immediately.');
         vscode.window.showWarningMessage(
             'Sub-Agents: Language Server bridge not available. '
             + 'Sub-agent creation will not work until the LS is discovered. '
             + 'Try restarting Antigravity.',
         );
+    } else {
+        log('LS Bridge ready');
     }
 
     // ─── Create Orchestrator ────────────────────────────────────────
@@ -93,9 +107,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     context.subscriptions.push(orchestrator);
 
     // ─── TreeView Sidebar ───────────────────────────────────────────
+    const statusTree = new StatusTreeProvider();
     const activeTree = new ActiveTreeProvider(orchestrator);
     const historyTree = new HistoryTreeProvider(orchestrator);
 
+    const statusView = vscode.window.createTreeView('subagents.status', {
+        treeDataProvider: statusTree,
+        showCollapseAll: false,
+    });
     const activeView = vscode.window.createTreeView('subagents.active', {
         treeDataProvider: activeTree,
         showCollapseAll: true,
@@ -105,7 +124,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         showCollapseAll: false,
     });
 
-    context.subscriptions.push(activeView, historyView, activeTree, historyTree);
+    context.subscriptions.push(statusView, activeView, historyView, statusTree, activeTree, historyTree);
 
     // Update active view badge with running count — REALTIME
     orchestrator.onEvent(() => {
@@ -161,6 +180,72 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             }
         });
     }
+
+    // ─── Status Panel Polling (3s) + Auto-Fix ─────────────────────
+    // Initial status (MCP server health will be updated async)
+    statusTree.updateStatus({
+        sdk: !!sdk,
+        lsBridge: !!sdk?.ls?.isReady,
+        mcpBridge: mcpPort > 0,
+        mcpBridgePort: mcpPort,
+        mcpServerStatus: 'initializing',
+        mcpServerError: '',
+        cdpConnected: false,
+        cdpPort: cdpPort,
+        cdpTarget: '',
+        defaultModel: getConfig().get<string>('defaultModel', 'flash') || 'flash',
+    });
+
+    // Initial MCP health check via LS RPC
+    let lastMcpStatus: McpServerHealth = 'initializing';
+    queryMcpServerHealth().then(({ status, error }) => {
+        lastMcpStatus = status;
+        statusTree.patchStatus({ mcpServerStatus: status, mcpServerError: error });
+        // Auto-fix on first check if broken
+        if (status === 'error' || status === 'not_found') {
+            log(`MCP server ${status} on startup — auto-fixing...`);
+            autoFixMcpServer(context, mcpPort, statusTree);
+        }
+    });
+
+    // Poll status every 3 seconds (MCP health is async)
+    // Auto-fix is debounced: only one auto-fix attempt per 30s
+    let lastAutoFixTime = 0;
+    const AUTO_FIX_COOLDOWN = 30_000; // 30s between auto-fix attempts
+
+    const statusPollTimer = setInterval(async () => {
+        const { status: mcpStatus, error: mcpError } = await queryMcpServerHealth();
+
+        // Log only on MCP status transitions
+        if (mcpStatus !== lastMcpStatus) {
+            log(`MCP status: ${lastMcpStatus} → ${mcpStatus}${mcpError ? ` (${mcpError.substring(0, 60)})` : ''}`);
+            lastMcpStatus = mcpStatus;
+        }
+
+        statusTree.updateStatus({
+            sdk: !!sdk,
+            lsBridge: !!sdk?.ls?.isReady,
+            mcpBridge: mcpPort > 0,
+            mcpBridgePort: mcpPort,
+            mcpServerStatus: mcpStatus,
+            mcpServerError: mcpError,
+            cdpConnected: !!cdpInjector?.isConnected,
+            cdpPort: cdpPort,
+            cdpTarget: cdpInjector?.targetTitle || '',
+            defaultModel: getConfig().get<string>('defaultModel', 'flash') || 'flash',
+        });
+
+        // Auto-fix if MCP server is broken (debounced)
+        if (mcpStatus === 'error' || mcpStatus === 'not_found') {
+            const now = Date.now();
+            if (now - lastAutoFixTime > AUTO_FIX_COOLDOWN) {
+                lastAutoFixTime = now;
+                log(`MCP server ${mcpStatus} — auto-fixing...`);
+                await autoFixMcpServer(context, mcpPort, statusTree);
+            }
+        }
+    }, 3000);
+    context.subscriptions.push({ dispose: () => clearInterval(statusPollTimer) });
 
     // ─── Commands ───────────────────────────────────────────────────
 
@@ -263,117 +348,119 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         }),
     );
 
-    console.log('[SubAgents] ✅ Extension activated');
+    // Fix MCP Server (reinstall config + refresh LS)
+    context.subscriptions.push(
+        vscode.commands.registerCommand('subagents.fixMcpServer', async () => {
+            await fixMcpServer(context, mcpPort, statusTree);
+        }),
+    );
+
+    log('✅ Extension activated');
 }
 
-// ─── MCP Auto-Install ───────────────────────────────────────────────────
+// ─── MCP Config Helpers ──────────────────────────────────────────────────
 
-/**
- * Check if the MCP server is configured, and if not, install it.
- *
- * Strategy:
- * 1. Try to poll MCP server states via the SDK command
- * 2. Look for our 'subagents' server in the list
- * 3. If not found, write the config and prompt for restart
- *
- * The MCP config file for Antigravity is at:
- * - Windows: %APPDATA%\Antigravity\User\mcp_config.json (or .antigravity/mcp_config.json)
- * - Fallback: use vscode command to open it
- */
-async function autoInstallMcpConfig(context: vscode.ExtensionContext, bridgePort: number): Promise<void> {
-    const mcpScriptPath = path.join(context.extensionPath, 'mcp-server.js');
-
-    // Strategy 1: Try to find mcp_config.json in known locations
-    const possiblePaths = [
+/** All known MCP config file locations, ordered by priority (primary first) */
+function getMcpConfigPaths(): string[] {
+    return [
+        // .gemini/antigravity is where the LS actually reads from
+        path.join(process.env.USERPROFILE || '', '.gemini', 'antigravity', 'mcp_config.json'),
         path.join(process.env.APPDATA || '', 'Antigravity', 'User', 'mcp_config.json'),
         path.join(process.env.USERPROFILE || '', '.antigravity', 'mcp_config.json'),
         path.join(process.env.APPDATA || '', 'Antigravity', 'mcp_config.json'),
     ];
+}
 
-    let configPath: string | null = null;
-    let existingConfig: any = null;
+/** Build the subagents MCP entry with correct Antigravity protobuf format */
+function buildSubagentsEntry(scriptPath: string, bridgePort: number): Record<string, any> {
+    return {
+        $typeName: 'exa.cascade_plugins_pb.CascadePluginCommandTemplate',
+        command: 'node',
+        args: [scriptPath],
+        env: {
+            SUBAGENTS_BRIDGE_PORT: String(bridgePort),
+        },
+    };
+}
 
-    for (const p of possiblePaths) {
+/**
+ * Find the first existing MCP config file. Returns path + parsed content.
+ * If none found, returns the primary path with null content.
+ */
+function findMcpConfig(): { configPath: string; existingConfig: any } {
+    for (const p of getMcpConfigPaths()) {
         if (fs.existsSync(p)) {
             try {
-                existingConfig = JSON.parse(fs.readFileSync(p, 'utf8'));
-                configPath = p;
+                const content = JSON.parse(fs.readFileSync(p, 'utf8'));
                 console.log(`[SubAgents] Found MCP config at: ${p}`);
-                break;
+                return { configPath: p, existingConfig: content };
             } catch {
-                // Invalid JSON, we'll recreate it
-                configPath = p;
-                break;
+                return { configPath: p, existingConfig: null };
             }
         }
     }
+    const primary = getMcpConfigPaths()[0];
+    console.log(`[SubAgents] No MCP config found. Will create at: ${primary}`);
+    return { configPath: primary, existingConfig: null };
+}
 
-    // If no config file found, create one at the first path
-    if (!configPath) {
-        configPath = possiblePaths[0];
-        console.log(`[SubAgents] No MCP config found. Will create at: ${configPath}`);
-    }
-
-    // Check if our server is already configured
+/**
+ * Write the subagents entry into the MCP config file.
+ * Preserves all other servers. Returns true on success.
+ */
+function writeMcpSubagentsConfig(configPath: string, existingConfig: any, scriptPath: string, bridgePort: number): boolean {
     const mcpServers = existingConfig?.mcpServers || {};
-    const existingEntry = mcpServers.subagents;
+    const newConfig = {
+        ...existingConfig,
+        mcpServers: {
+            ...mcpServers,
+            subagents: buildSubagentsEntry(scriptPath, bridgePort),
+        },
+    };
 
+    try {
+        const dir = path.dirname(configPath);
+        if (!fs.existsSync(dir)) {
+            fs.mkdirSync(dir, { recursive: true });
+        }
+        fs.writeFileSync(configPath, JSON.stringify(newConfig, null, 2), 'utf8');
+        console.log(`[SubAgents] MCP config written to: ${configPath}`);
+        console.log(`[SubAgents] Script path: ${scriptPath}`);
+        return true;
+    } catch (err: any) {
+        console.warn(`[SubAgents] Failed to write MCP config: ${err.message}`);
+        return false;
+    }
+}
+
+// ─── MCP Auto-Install ──────────────────────────────────────────────────
+
+/**
+ * Check if the MCP server is configured, and if not, install it.
+ * Also fixes stale paths (e.g. after moving the project).
+ */
+async function autoInstallMcpConfig(context: vscode.ExtensionContext, bridgePort: number): Promise<void> {
+    const mcpScriptPath = path.join(context.extensionPath, 'mcp-server.js');
+    const { configPath, existingConfig } = findMcpConfig();
+
+    // Check if our server is already configured with the correct path
+    const existingEntry = existingConfig?.mcpServers?.subagents;
     if (existingEntry) {
-        // Check if the script path matches and port is current
         const currentArgs = existingEntry.args || [];
         const currentPort = existingEntry.env?.SUBAGENTS_BRIDGE_PORT;
         if (currentArgs[0] === mcpScriptPath && String(currentPort) === String(bridgePort)) {
             console.log('[SubAgents] MCP config already up to date');
             return;
         }
-        console.log('[SubAgents] MCP config exists but needs update');
+        console.log(`[SubAgents] MCP config exists but needs update (path: ${currentArgs[0]} → ${mcpScriptPath})`);
     }
 
-    // Install/update the config
-    const newConfig = {
-        ...existingConfig,
-        mcpServers: {
-            ...mcpServers,
-            subagents: {
-                command: 'node',
-                args: [mcpScriptPath],
-                env: {
-                    SUBAGENTS_BRIDGE_PORT: String(bridgePort),
-                },
-            },
-        },
-    };
-
-    try {
-        // Ensure directory exists
-        const dir = path.dirname(configPath);
-        if (!fs.existsSync(dir)) {
-            fs.mkdirSync(dir, { recursive: true });
-        }
-
-        fs.writeFileSync(configPath, JSON.stringify(newConfig, null, 2), 'utf8');
-        console.log(`[SubAgents] MCP config ${existingEntry ? 'updated' : 'installed'} at: ${configPath}`);
-
+    if (writeMcpSubagentsConfig(configPath, existingConfig, mcpScriptPath, bridgePort)) {
+        await refreshMcpServers();
         if (!existingEntry) {
-            // First install — prompt for MCP page
-            const choice = await vscode.window.showInformationMessage(
-                '🔌 Sub-Agents MCP server installed! '
-                + 'You may need to open the "Manage MCPs" page and verify the server is running.',
-                'Open MCP Settings',
-                'Dismiss',
-            );
-            if (choice === 'Open MCP Settings') {
-                try {
-                    await vscode.commands.executeCommand('antigravity.openMcpConfigFile');
-                } catch {
-                    // Open the file directly as fallback
-                    const doc = await vscode.workspace.openTextDocument(configPath);
-                    await vscode.window.showTextDocument(doc);
-                }
-            }
+            vscode.window.showInformationMessage('🔌 Sub-Agents MCP server installed and refreshed!');
         }
-    } catch (err: any) {
-        console.warn(`[SubAgents] Failed to write MCP config: ${err.message}`);
+    } else {
         // Fallback: show manual instructions
         const choice = await vscode.window.showWarningMessage(
             '⚠️ Could not auto-install MCP config. Please add the subagents server manually.',
@@ -390,11 +477,7 @@ async function autoInstallMcpConfig(context: vscode.ExtensionContext, bridgePort
             }
         } else if (choice === 'Copy Config') {
             const config = JSON.stringify({
-                subagents: {
-                    command: 'node',
-                    args: [mcpScriptPath],
-                    env: { SUBAGENTS_BRIDGE_PORT: String(bridgePort) },
-                },
+                subagents: buildSubagentsEntry(mcpScriptPath, bridgePort),
             }, null, 2);
             await vscode.env.clipboard.writeText(config);
             vscode.window.showInformationMessage('MCP config copied to clipboard. Paste into your mcp_config.json.');
@@ -436,27 +519,20 @@ async function showHealthCheck(context: vscode.ExtensionContext, mcpPort: number
         : '❌ MCP Bridge: not running',
     );
 
-    // 4. MCP Config
-    const mcpScriptPath = path.join(context.extensionPath, 'mcp-server.js');
-    const mcpConfigPaths = [
-        path.join(process.env.APPDATA || '', 'Antigravity', 'User', 'mcp_config.json'),
-        path.join(process.env.USERPROFILE || '', '.antigravity', 'mcp_config.json'),
-        path.join(process.env.APPDATA || '', 'Antigravity', 'mcp_config.json'),
-    ];
-    let mcpConfigFound = false;
-    for (const p of mcpConfigPaths) {
-        if (fs.existsSync(p)) {
-            try {
-                const cfg = JSON.parse(fs.readFileSync(p, 'utf8'));
-                if (cfg.mcpServers?.subagents) {
-                    mcpConfigFound = true;
-                    items.push(`✅ MCP Config: installed at ${path.basename(path.dirname(p))}/${path.basename(p)}`);
-                }
-            } catch { /* invalid JSON */ }
-        }
-    }
-    if (!mcpConfigFound) {
-        items.push('❌ MCP Config: not installed (agents cannot use sub-agents tool)');
+    // 4. MCP Server (live LS status)
+    const { status: mcpHealth, error: mcpErr } = await queryMcpServerHealth();
+    switch (mcpHealth) {
+        case 'running':
+        case 'initializing':
+        case 'unknown':
+            items.push('✅ MCP Server: installed');
+            break;
+        case 'error':
+            items.push(`❌ MCP Server: error — ${mcpErr.substring(0, 60)}`);
+            break;
+        case 'not_found':
+            items.push('❌ MCP Server: not configured');
+            break;
     }
 
     // 5. CDP Status
@@ -496,10 +572,8 @@ async function showHealthCheck(context: vscode.ExtensionContext, mcpPort: number
     if (pick) {
         if (pick.label.includes('CDP') && pick.label.includes('❌')) {
             setupCdpLaunch();
-        } else if (pick.label.includes('MCP Config') && pick.label.includes('❌')) {
-            if (mcpPort > 0) {
-                await autoInstallMcpConfig(context, mcpPort);
-            }
+        } else if (pick.label.includes('MCP Server') && (pick.label.includes('❌') || pick.label.includes('⚠️'))) {
+            vscode.commands.executeCommand('subagents.fixMcpServer');
         } else if (pick.label.includes('Default Model')) {
             vscode.commands.executeCommand('workbench.action.openSettings', 'subagents.defaultModel');
         }
@@ -664,11 +738,11 @@ async function setupCdpLaunch(): Promise<void> {
 
     const choice = await vscode.window.showInformationMessage(
         'Sub-Agents: To show sub-agent status directly inside the Agent Manager sidebar, '
-        + `Antigravity needs to be launched with CDP enabled (port ${cdpPort}).\\n\\n`
-        + 'Choose a setup method:',
+        + `Antigravity needs to be launched with CDP enabled (port ${cdpPort}).\n\n`
+        + 'This will create a .bat file on your Desktop that launches Antigravity with '
+        + 'the --remote-debugging-port flag.',
         { modal: true },
         'Create Launch Script',
-        'Set Environment Variable',
     );
 
     if (choice === 'Create Launch Script') {
@@ -682,21 +756,139 @@ async function setupCdpLaunch(): Promise<void> {
         const scriptContent = `@echo off\nstart "" "${exePath}" --remote-debugging-port=${cdpPort}\n`;
         fs.writeFileSync(desktopPath, scriptContent, 'utf8');
         vscode.window.showInformationMessage(
-            `✅ Created "${desktopPath}". Use this to launch Antigravity with CDP enabled.`,
-        );
-    } else if (choice === 'Set Environment Variable') {
-        const terminal = vscode.window.createTerminal('Sub-Agents Setup');
-        terminal.show();
-        terminal.sendText(
-            `[System.Environment]::SetEnvironmentVariable("ELECTRON_EXTRA_LAUNCH_ARGS", "--remote-debugging-port=${cdpPort}", "User")`,
-        );
-        terminal.sendText('Write-Output "✅ Environment variable set. Restart Antigravity for changes to take effect."');
-        vscode.window.showInformationMessage(
-            'After restarting Antigravity, CDP will be available automatically.',
+            `✅ Created "${desktopPath}". Close Antigravity and use this script to relaunch with CDP enabled.`,
         );
     }
 }
 
+// ─── MCP Server Health (LS RPC) ─────────────────────────────────────────
+
+/**
+ * Query the Language Server's GetMcpServerStates RPC to get the live
+ * status of our 'subagents' MCP server.
+ *
+ * Returns the health status and any error message.
+ */
+async function queryMcpServerHealth(): Promise<{ status: McpServerHealth; error: string }> {
+    try {
+        if (!sdk?.ls?.isReady) {
+            return { status: 'unknown', error: '' };
+        }
+
+        const response = await sdk.ls.rawRPC('GetMcpServerStates', {});
+        const states = response?.states || [];
+        const subagentsState = states.find((s: any) => s.spec?.serverName === 'subagents');
+
+        if (!subagentsState) {
+            return { status: 'not_found', error: '' };
+        }
+
+        // Protobuf JSON: zero-value enum fields (OK = 0) are OMITTED.
+        // So absent/undefined/null/'' status all mean healthy.
+        const rawStatus = subagentsState.status;
+        const lsError = subagentsState.error || '';
+
+        // Healthy states: absent (proto zero), READY, OK, RUNNING
+        if (rawStatus === undefined || rawStatus === null || rawStatus === '' ||
+            rawStatus === 'MCP_SERVER_STATUS_OK' ||
+            rawStatus === 'MCP_SERVER_STATUS_READY' ||
+            rawStatus === 'MCP_SERVER_STATUS_RUNNING') {
+            return { status: 'running', error: '' };
+        }
+        if (rawStatus === 'MCP_SERVER_STATUS_ERROR') {
+            return { status: 'error', error: lsError };
+        }
+        if (rawStatus === 'MCP_SERVER_STATUS_LOADING' || rawStatus === 'MCP_SERVER_STATUS_STARTING') {
+            return { status: 'initializing', error: '' };
+        }
+
+        // Unknown status string — log once for future mapping, treat as healthy
+        log(`MCP health: unrecognized status '${rawStatus}', treating as running`);
+        return { status: 'running', error: '' };
+    } catch (err: any) {
+        log(`MCP health query failed: ${err.message}`);
+        return { status: 'unknown', error: '' };
+    }
+}
+
+/**
+ * Tell the Language Server to reload MCP server configurations.
+ * This picks up changes to mcp_config.json without needing a restart.
+ */
+async function refreshMcpServers(): Promise<void> {
+    try {
+        if (!sdk?.ls?.isReady) {
+            log('Cannot refresh MCP servers: LS not ready');
+            return;
+        }
+        await sdk.ls.rawRPC('RefreshMcpServers', {});
+        log('RefreshMcpServers RPC sent');
+    } catch (err: any) {
+        // 'loading already in progress' is expected when LS is still initializing
+        if (err.message?.includes('loading already in progress')) {
+            log('RefreshMcpServers: LS still loading — will pick up config on its own');
+        } else {
+            log(`RefreshMcpServers failed: ${err.message}`);
+        }
+    }
+}
+
+/**
+ * Fix MCP server: reinstall config with correct paths + refresh LS.
+ * Called from the status panel when the MCP server is in error state.
+ */
+async function fixMcpServer(
+    context: vscode.ExtensionContext,
+    mcpPort: number,
+    statusTree: StatusTreeProvider,
+): Promise<void> {
+    const ok = await autoFixMcpServer(context, mcpPort, statusTree);
+    if (ok) {
+        vscode.window.showInformationMessage(
+            '✅ MCP config reinstalled and LS refreshed. Server should restart shortly.',
+        );
+    } else {
+        vscode.window.showErrorMessage('Failed to fix MCP config. Check the output log for details.');
+    }
+}
+
+/**
+ * Silent auto-fix: updates the MCP config with correct paths + refreshes LS.
+ * Returns true on success. Used both by the manual fix command and the auto-fix poll.
+ */
+async function autoFixMcpServer(
+    context: vscode.ExtensionContext,
+    mcpPort: number,
+    statusTree: StatusTreeProvider,
+): Promise<boolean> {
+    const mcpScriptPath = path.join(context.extensionPath, 'mcp-server.js');
+    const { configPath, existingConfig } = findMcpConfig();
+
+    log(`Auto-fixing MCP config at: ${configPath}`);
+    log(`Correct script path: ${mcpScriptPath}`);
+    const currentPath = existingConfig?.mcpServers?.subagents?.args?.[0];
+    if (currentPath && currentPath !== mcpScriptPath) {
+        log(`Path mismatch: config has '${currentPath}', should be '${mcpScriptPath}'`);
+    }
+
+    if (writeMcpSubagentsConfig(configPath, existingConfig, mcpScriptPath, mcpPort)) {
+        // Tell LS to reload
+        await refreshMcpServers();
+
+        // Update status immediately
+        statusTree.patchStatus({ mcpServerStatus: 'initializing', mcpServerError: '' });
+
+        // Re-check after a delay
+        setTimeout(async () => {
+            const { status, error } = await queryMcpServerHealth();
+            statusTree.patchStatus({ mcpServerStatus: status, mcpServerError: error });
+        }, 3000);
+
+        return true;
+    }
+    return false;
+}
+
 export function deactivate(): void {
-    console.log('[SubAgents] Deactivating...');
+    log('Deactivating Sub-Agents extension');
 }

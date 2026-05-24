@@ -24,6 +24,169 @@ import {
     formatElapsed,
 } from './types';
 
+// ─── Status Data Interface ──────────────────────────────────────────────
+
+/** MCP server health status from the Language Server */
+export type McpServerHealth = 'unknown' | 'initializing' | 'running' | 'error' | 'not_found';
+
+export interface IStatusData {
+    sdk: boolean;
+    lsBridge: boolean;
+    mcpBridge: boolean;
+    mcpBridgePort: number;
+    /** Live MCP server health from LS RPC (replaces static file check) */
+    mcpServerStatus: McpServerHealth;
+    /** Error message from the LS if the MCP server is in error state */
+    mcpServerError: string;
+    cdpConnected: boolean;
+    cdpPort: number;
+    cdpTarget: string;
+    defaultModel: string;
+}
+
+// ─── Extension Status TreeView ──────────────────────────────────────────
+
+export class StatusTreeProvider implements vscode.TreeDataProvider<vscode.TreeItem> {
+    private readonly _onDidChangeTreeData = new vscode.EventEmitter<void>();
+    readonly onDidChangeTreeData = this._onDidChangeTreeData.event;
+    private _status: IStatusData | null = null;
+
+    /** Last known status (used by extension.ts to carry forward values) */
+    get lastStatus(): IStatusData | null { return this._status; }
+
+    /** Full status update — triggers tree refresh */
+    updateStatus(status: IStatusData): void {
+        this._status = status;
+        this._onDidChangeTreeData.fire();
+    }
+
+    /** Partial status update — merges with existing */
+    patchStatus(partial: Partial<IStatusData>): void {
+        if (this._status) {
+            this._status = { ...this._status, ...partial };
+            this._onDidChangeTreeData.fire();
+        }
+    }
+
+    refresh(): void {
+        this._onDidChangeTreeData.fire();
+    }
+
+    getTreeItem(element: vscode.TreeItem): vscode.TreeItem {
+        return element;
+    }
+
+    getChildren(): vscode.TreeItem[] {
+        if (!this._status) {
+            const loading = new vscode.TreeItem('Loading status...');
+            loading.iconPath = new vscode.ThemeIcon('loading~spin');
+            return [loading];
+        }
+
+        const items: vscode.TreeItem[] = [];
+        const s = this._status;
+
+        // SDK
+        items.push(this._makeItem(
+            'SDK',
+            s.sdk ? 'Initialized' : 'Not initialized',
+            s.sdk,
+        ));
+
+        // LS Bridge
+        items.push(this._makeItem(
+            'LS Bridge',
+            s.lsBridge ? 'Connected' : 'Not connected',
+            s.lsBridge,
+        ));
+
+        // MCP Bridge (our HTTP server)
+        items.push(this._makeItem(
+            'MCP Bridge',
+            s.mcpBridge ? `Port ${s.mcpBridgePort}` : 'Not running',
+            s.mcpBridge,
+        ));
+
+        // MCP Server (live status from LS RPC)
+        const mcpItem = this._makeMcpServerItem(s);
+        items.push(mcpItem);
+
+        // CDP
+        const cdpDesc = s.cdpConnected
+            ? `Port ${s.cdpPort}` + (s.cdpTarget ? ` → ${s.cdpTarget}` : '')
+            : `Port ${s.cdpPort} — not connected`;
+        items.push(this._makeItem(
+            'CDP',
+            cdpDesc,
+            s.cdpConnected,
+        ));
+
+        // Default Model (info item)
+        const modelItem = new vscode.TreeItem(`Model: ${s.defaultModel}`);
+        modelItem.iconPath = new vscode.ThemeIcon('symbol-misc', new vscode.ThemeColor('charts.purple'));
+        modelItem.description = '';
+        modelItem.command = {
+            command: 'workbench.action.openSettings',
+            title: 'Change Default Model',
+            arguments: ['subagents.defaultModel'],
+        };
+        items.push(modelItem);
+
+        return items;
+    }
+
+    /** Build the MCP Server status item — only 2 user-visible states: Installed or Error */
+    private _makeMcpServerItem(s: IStatusData): vscode.TreeItem {
+        // Green: running, initializing, or unknown (not worth alarming the user)
+        if (s.mcpServerStatus === 'running' || s.mcpServerStatus === 'initializing' || s.mcpServerStatus === 'unknown') {
+            const item = this._makeItem('MCP Server', 'Installed', true);
+            item.tooltip = s.mcpServerStatus === 'running'
+                ? 'MCP Server is running and healthy'
+                : 'MCP Server is starting up...';
+            return item;
+        }
+
+        // Red: error state with detail
+        if (s.mcpServerStatus === 'error') {
+            const item = this._makeItem('MCP Server', 'Error', false);
+            const errorPreview = s.mcpServerError.length > 200
+                ? s.mcpServerError.substring(0, 200) + '...'
+                : s.mcpServerError;
+            item.tooltip = new vscode.MarkdownString(
+                `**MCP Server: Error**\n\n\`\`\`\n${errorPreview}\n\`\`\`\n\n*Click to reinstall and refresh*`,
+            );
+            item.command = {
+                command: 'subagents.fixMcpServer',
+                title: 'Fix MCP Server',
+            };
+            return item;
+        }
+
+        // Red: not_found — no config entry at all
+        const item = this._makeItem('MCP Server', 'Not configured', false);
+        item.tooltip = 'MCP server is not configured in mcp_config.json. Click to install.';
+        item.command = {
+            command: 'subagents.fixMcpServer',
+            title: 'Install MCP Config',
+        };
+        return item;
+    }
+
+    private _makeItem(label: string, description: string, ok: boolean): vscode.TreeItem {
+        const item = new vscode.TreeItem(label);
+        item.description = description;
+        item.iconPath = ok
+            ? new vscode.ThemeIcon('pass-filled', new vscode.ThemeColor('charts.green'))
+            : new vscode.ThemeIcon('error', new vscode.ThemeColor('charts.red'));
+        item.tooltip = `${label}: ${description}`;
+        return item;
+    }
+
+    dispose(): void {
+        this._onDidChangeTreeData.dispose();
+    }
+}
+
 // ─── Tree Item Types ────────────────────────────────────────────────────
 
 class BatchItem extends vscode.TreeItem {

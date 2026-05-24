@@ -5,6 +5,32 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] — 2026-05-24
+
+### Added
+
+- **Extension Status Panel** — New "Extension Status" tree view at top of the Sub-Agents sidebar showing live health of SDK, LS Bridge, MCP Bridge, MCP Server, CDP, and default model.
+- **Live MCP Server Health** — Queries `GetMcpServerStates` LS RPC every 3 seconds to show actual server status (not just config file presence). Correctly handles protobuf zero-value omission and `MCP_SERVER_STATUS_READY` enum.
+- **Auto-Fix MCP Config** — Automatically detects and repairs broken MCP configs (e.g. stale paths after moving the project directory). Rewrites `mcp_config.json` with correct paths and calls `RefreshMcpServers` RPC — no manual intervention required. Debounced at 30s intervals.
+- **Fix MCP Server Command** — `Sub-Agents: Fix MCP Server (Reinstall & Refresh)` command for manual repair. Also accessible by clicking the MCP Server status item when in error state.
+- **Output Channel** — "Sub-Agents" output channel for diagnostics. Logs status transitions, auto-fix operations, and RPC errors. Only logs on state *changes*, not every poll.
+
+### Fixed
+
+- **Wrong MCP config path** — Was writing to `%APPDATA%\Antigravity\User\mcp_config.json` but the LS reads from `%USERPROFILE%\.gemini\antigravity\mcp_config.json`. Now discovers and writes to the correct file.
+- **Missing `$typeName` field** — Antigravity's protobuf-based MCP config requires `"$typeName": "exa.cascade_plugins_pb.CascadePluginCommandTemplate"`. Now included in all written entries.
+- **MCP status stuck on "Checking..."** — The `MCP_SERVER_STATUS_READY` enum was unrecognized, falling through to "unknown". Now correctly mapped to healthy/green.
+- **`RefreshMcpServers` error spam** — `"loading already in progress"` error during startup is now handled gracefully (expected during LS init).
+
+### Removed
+
+- **"Set Environment Variable" CDP setup option** — Removed non-functional `ELECTRON_EXTRA_LAUNCH_ARGS` approach. Only the reliable "Create Launch Script" batch file method is kept.
+
+### Changed
+
+- **Simplified MCP status display** — Only 2 user-visible states: ✅ Installed (green) or ❌ Error (red). No intermediate "Checking..." / "Loading..." states that cause confusion.
+- **DRY MCP config helpers** — Extracted `getMcpConfigPaths()`, `findMcpConfig()`, `writeMcpSubagentsConfig()`, and `buildSubagentsEntry()` shared helpers.
+
 ## [0.1.0] — 2026-05-24
 
 ### Added
@@ -38,4 +64,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - MutationObserver + setInterval watchers for persistent UI enforcement.
 - Background poll loop with trajectory summary diffing for progress tracking.
 
+[0.2.0]: https://github.com/abdofallah/Antigravity-Sub-Agents/releases/tag/v0.2.0
 [0.1.0]: https://github.com/abdofallah/Antigravity-Sub-Agents/releases/tag/v0.1.0
