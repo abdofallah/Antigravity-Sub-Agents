@@ -1,7 +1,27 @@
+# Source & config
 .git
-src
-node_modules
+src/
+node_modules/
 tsconfig.json
 tsup.config.ts
-*.map
 .gitignore
+
+# Dev / debug artifacts
+*.map
+*.txt
+*.json.bak
+test-*.js
+extract-*.js
+manager-*.json
+
+# Docs & CI (not needed at runtime)
+.github/
+docs/
+CONTRIBUTING.md
+CHANGELOG.md
+
+# Vendor SDK source maps
+vendor/antigravity-sdk/dist/*.map
+vendor/antigravity-sdk/LEGAL.md
+vendor/antigravity-sdk/LICENSE
+vendor/antigravity-sdk/README.md

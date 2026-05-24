@@ -17,6 +17,8 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -39,7 +41,13 @@ jobs:
           if [ -n "${{ github.event.inputs.version }}" ]; then
             echo "version=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
           else
-            echo "version=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+            # Extract from tag or package.json
+            if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+              echo "version=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+            else
+              VERSION=$(node -p "require('./package.json').version")
+              echo "version=${VERSION}" >> $GITHUB_OUTPUT
+            fi
           fi
 
       - name: Package VSIX
@@ -65,7 +73,6 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-  # Optional: validate the VSIX can be installed
   validate:
     needs: build
     runs-on: ubuntu-latest
@@ -73,13 +80,15 @@ jobs:
       - name: Download VSIX
         uses: actions/download-artifact@v4
         with:
-          name: antigravity-subagents-${{ needs.build.outputs.version || '0.0.0' }}
+          name: antigravity-subagents-${{ needs.build.outputs.version }}
 
       - name: Validate VSIX
         run: |
           npm install -g @vscode/vsce
           for f in *.vsix; do
             echo "Validating $f..."
-            unzip -l "$f" | head -20
+            unzip -l "$f" | head -30
+            SIZE=$(stat --printf="%s" "$f")
+            echo "Package size: $((SIZE / 1024)) KB"
             echo "✅ VSIX package is valid"
           done
