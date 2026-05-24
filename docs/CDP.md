@@ -1,0 +1,350 @@
+# Chrome DevTools Protocol (CDP) Injection — Deep Dive
+
+This document explains how the Antigravity Sub-Agents extension injects real-time status UI into the Agent Manager sidebar using Chrome DevTools Protocol.
+
+## Table of Contents
+
+- [Why CDP?](#why-cdp)
+- [How Antigravity IDE Works](#how-antigravity-ide-works)
+- [CDP Connection Flow](#cdp-connection-flow)
+- [Target Management](#target-management)
+- [DOM Injection Strategy](#dom-injection-strategy)
+- [Trusted Types CSP Compliance](#trusted-types-csp-compliance)
+- [Router Subscription](#router-subscription)
+- [Persistent UI Enforcement](#persistent-ui-enforcement)
+- [Chat Locking](#chat-locking)
+- [Setup Guide](#setup-guide)
+- [Troubleshooting](#troubleshooting)
+
+---
+
+## Why CDP?
+
+Antigravity IDE's Agent Manager (the chat sidebar) is a **web-based UI** running inside an Electron BrowserWindow. The extension API doesn't provide hooks to modify this UI. However, since Electron is built on Chromium, we can use the **Chrome DevTools Protocol** to:
+
+1. Connect to the renderer process via WebSocket.
+2. Execute JavaScript in the page context.
+3. Manipulate the DOM to inject our status panel.
+4. Subscribe to events for real-time updates.
+
+This is the same protocol that Chrome DevTools itself uses.
+
+## How Antigravity IDE Works
+
+Antigravity IDE has multiple Electron windows/targets:
+
+| Target | Title | Role |
+|--------|-------|------|
+| Page | `"Launchpad"` | Initial splash screen |
+| Page | `"Manager"` | Agent Manager sidebar (our target) |
+| Page | `"9router - Antigravity"` | Main editor workbench |
+| Worker | (unnamed) | Service workers |
+
+The **Manager** target is the one that renders the chat interface. It appears after the Launchpad loads, which is why we implement target hot-switching.
+
+## CDP Connection Flow
+
+```
+1. Extension activates
+   │
+2. Probe CDP port (default: 9347)
+   │  GET http://127.0.0.1:9347/json
+   │
+3. Receive target list
+   │  [ { id, type, title, webSocketDebuggerUrl }, ... ]
+   │
+4. Find best target (prefer "Manager", fallback to "Launchpad")
+   │
+5. Connect WebSocket to target's debugger URL
+   │  ws://127.0.0.1:9347/devtools/page/{targetId}
+   │
+6. Enable Runtime domain
+   │  → Runtime.enable
+   │
+7. Register CDP bindings
+   │  → Runtime.addBinding("__saRouterChange")    // Route events
+   │  → Runtime.addBinding("__saCancelAction")    // Cancel buttons
+   │
+8. Inject CSS + JavaScript
+   │  → Runtime.evaluate(cssScript)
+   │  → Runtime.evaluate(mainScript)
+   │
+9. Start refresh loop + heartbeat + target rescan
+```
+
+### Port Discovery
+
+The CDP port is configured via:
+
+```bash
+# Launch flag (recommended)
+Antigravity.exe --remote-debugging-port=9347
+
+# Environment variable (persistent)
+ELECTRON_EXTRA_LAUNCH_ARGS=--remote-debugging-port=9347
+```
+
+The extension probes this port on activation and retries every 10 seconds.
+
+### WebSocket Module Resolution
+
+The `ws` npm package is not bundled with the extension. Instead, we resolve it from the IDE's own `node_modules`:
+
+```
+C:\Users\{user}\AppData\Local\Programs\Antigravity IDE\
+  resources\app\node_modules\ws
+```
+
+This avoids bundling issues and uses the exact same WebSocket implementation as the IDE itself.
+
+## Target Management
+
+### Hot-Switching
+
+The Launchpad target loads first, and the Manager target appears later. The extension handles this:
+
+```
+1. Initial connection → "Launchpad" (best available)
+2. Start target rescan timer (5s interval)
+3. Rescan detects "Manager" target appears
+4. Gracefully close Launchpad WebSocket
+5. Connect to Manager target
+6. Re-inject CSS + JavaScript
+```
+
+The `_switching` flag prevents the close handler from triggering a reconnection loop.
+
+### Heartbeat
+
+Every 10 seconds, the extension sends a no-op CDP call to verify the connection is alive. If the heartbeat fails, it triggers reconnection.
+
+## DOM Injection Strategy
+
+### Target Location
+
+The status panel is injected into the **right panel** of the Agent Manager UI. The injection point is identified by this DOM hierarchy:
+
+```html
+<div id="antigravity.agentSidePanelInputBox">
+  <!-- Existing chat input area -->
+</div>
+
+<!-- We inject ABOVE this, targeting the section above the input box -->
+```
+
+Specifically, we find the **scrollable messages container** (identified by `overflow-y-auto` class) and append our panel there.
+
+### Two-Phase Injection
+
+**Phase 1: Create Shell**
+
+On first injection, create the persistent container:
+
+```html
+<div id="sa-section" style="...">
+  <div id="sa-header">
+    <span class="sa-spinner"></span>
+    <span>N sub-agents running</span>
+    <button id="sa-stop-all-btn">Stop All</button>
+  </div>
+  <div id="sa-items">
+    <!-- Agent cards go here -->
+  </div>
+</div>
+```
+
+**Phase 2: Update Content**
+
+On subsequent updates, only the children of `#sa-items` are cleared and repopulated. This minimizes DOM thrashing.
+
+### Agent Cards
+
+Each sub-agent gets a card element:
+
+```html
+<div class="sa-agent-card" style="...">
+  <div class="sa-dot sa-dot-running"></div>   <!-- Status indicator -->
+  <div>
+    <div>Agent Label</div>                     <!-- Name -->
+    <div>🧠 Pro-H · 12 steps · 2m 30s</div>  <!-- Stats -->
+  </div>
+  <div>
+    <button>Stop</button>                      <!-- Cancel button -->
+    <button>👁</button>                        <!-- View chat -->
+  </div>
+</div>
+```
+
+## Trusted Types CSP Compliance
+
+Antigravity IDE enforces **Trusted Types** Content Security Policy, which blocks `innerHTML`, `outerHTML`, and similar APIs. All DOM manipulation uses safe APIs:
+
+```typescript
+// ❌ BLOCKED by CSP
+element.innerHTML = '<div>...</div>';
+
+// ✅ ALLOWED — pure DOM API
+const div = document.createElement('div');
+div.textContent = 'Safe text';
+div.style.cssText = 'color: red;';
+parent.appendChild(div);
+```
+
+CSS injection uses a `<style>` element created via `document.createElement('style')` with a `TextNode` child, avoiding any CSP violations.
+
+## Router Subscription
+
+To detect which conversation the user is viewing, we subscribe to the **TanStack Router** that powers the Manager UI:
+
+```javascript
+// Subscribe to route changes
+var router = window.__TSR_ROUTER__;
+if (router && router.subscribe) {
+    router.subscribe('onResolved', function(ev) {
+        var matches = ev.toLocation?.matches || [];
+        for (var i = 0; i < matches.length; i++) {
+            if (matches[i].params?.cascadeId) {
+                window.__saRouterChange(JSON.stringify({
+                    convoId: matches[i].params.cascadeId
+                }));
+                break;
+            }
+        }
+    });
+}
+```
+
+The `__saRouterChange` CDP binding forwards route events to the extension's TypeScript code, which triggers panel refreshes.
+
+## Persistent UI Enforcement
+
+React's Virtual DOM constantly re-renders the Manager UI, which can destroy our injected elements. We use a multi-layer persistence strategy:
+
+### Layer 1: MutationObserver
+
+```javascript
+var obs = new MutationObserver(enforceLocks);
+obs.observe(document.body, { childList: true, subtree: true });
+```
+
+Any DOM change triggers our enforcement function.
+
+### Layer 2: setInterval Fallback
+
+```javascript
+setInterval(enforceLocks, 500);
+```
+
+Catches cases where MutationObserver misses a change.
+
+### Layer 3: Event-Driven Refresh
+
+The Orchestrator fires events on state changes, which trigger `injectSubAgentPanel()` in the CDP injector. This provides instant updates when agents complete.
+
+## Chat Locking
+
+### Sub-Agent Chats (View Only)
+
+When viewing a sub-agent's chat:
+
+1. **Input overlay** — absolute-positioned div over the chat input box with lock icon.
+2. **Revert button removal** — `[data-testid="revert-button"]` elements set to `display:none`.
+3. **Archive banner override** — "This chat is archived" banner's children hidden, replaced with "🔒 Sub-agent chat — view only" overlay.
+
+### Parent Chats (During Execution)
+
+When viewing the parent's chat while sub-agents run:
+
+1. **Input overlay** — shows spinner, running count, and "Stop All & Don't Report" button.
+2. The stop button triggers `__saCancelAction` with `type: 'silent'`.
+
+### Why Overlay Instead of Replace?
+
+React re-renders destroy text node changes instantly. Our strategy:
+
+```javascript
+// ❌ React immediately reverts this
+span.textContent = 'New text';
+
+// ✅ Hide original, overlay our own
+originalElement.style.display = 'none';
+var overlay = document.createElement('div');
+overlay.style.cssText = 'position:absolute;inset:0;...';
+parent.appendChild(overlay);
+```
+
+## Setup Guide
+
+### Method 1: Launch Script (Recommended)
+
+Create a `.bat` file on your desktop:
+
+```batch
+@echo off
+start "" "C:\...\Antigravity.exe" --remote-debugging-port=9347
+```
+
+### Method 2: Environment Variable (Persistent)
+
+```powershell
+[System.Environment]::SetEnvironmentVariable(
+    "ELECTRON_EXTRA_LAUNCH_ARGS",
+    "--remote-debugging-port=9347",
+    "User"
+)
+```
+
+After setting, restart Antigravity IDE.
+
+### Method 3: Extension Command
+
+Run `Sub-Agents: Setup CDP (Sidebar Injection)` from the command palette.
+
+### Verify
+
+After launching with CDP enabled:
+
+```bash
+curl http://127.0.0.1:9347/json/version
+```
+
+Expected response:
+
+```json
+{
+    "Browser": "Chrome/...",
+    "Protocol-Version": "1.3",
+    ...
+}
+```
+
+## Troubleshooting
+
+### "CDP not available"
+
+- Antigravity was not launched with `--remote-debugging-port=9347`.
+- Another process is using port 9347.
+- Check with: `netstat -an | findstr 9347`
+
+### "SCRIPT ERROR: SyntaxError"
+
+- Usually a brace mismatch in the injected JavaScript.
+- Check the "Sub-Agents CDP" output channel for details.
+- Run `Sub-Agents: Open Manager DevTools` to debug in the browser console.
+
+### Panel Not Appearing
+
+- The Manager target may not have loaded yet (wait a few seconds).
+- Check if the extension found the right target in the output log.
+- Try `Sub-Agents: Refresh` to force a re-injection.
+
+### UI Flickering
+
+- React re-renders are fighting with our DOM changes.
+- The MutationObserver should handle this, but extreme cases may need the `setInterval` fallback frequency adjusted.
+
+### Connection Drops
+
+- The heartbeat timer (10s) will detect disconnections.
+- Auto-reconnection triggers within 10 seconds.
+- Check the output channel for reconnection logs.

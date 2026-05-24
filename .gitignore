@@ -1,0 +1,47 @@
+# Dependencies
+node_modules/
+
+# Build output (root only)
+/dist/
+
+# Generated MCP server script
+mcp-server.js
+
+# OS files
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Debug / Dev artifacts
+*.json.bak
+commands-extract.txt
+sidebar-extract.txt
+webview-extract.txt
+extract-dom.js
+test-cdp.js
+manager-dom-deep.json
+manager-dom-tree.json
+manager-right-debug.json
+manager-right-panel.json
+manager-sidebar.json
+
+# Packaged extension
+*.vsix
+
+# Logs
+*.log
+npm-debug.log*
+
+# Environment
+.env
+.env.*
+
+# Lock files (optional — uncomment if you want to commit lock)
+# package-lock.json

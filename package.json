@@ -1,0 +1,189 @@
+{
+    "name": "antigravity-subagents",
+    "displayName": "Antigravity Sub-Agents",
+    "description": "Launch, monitor, and orchestrate parallel sub-agents inside Antigravity v1",
+    "version": "0.1.0",
+    "publisher": "darks",
+    "engines": {
+        "vscode": "^1.85.0"
+    },
+    "categories": ["Other"],
+    "activationEvents": ["onStartupFinished"],
+    "main": "./dist/extension.js",
+    "contributes": {
+        "viewsContainers": {
+            "activitybar": [
+                {
+                    "id": "subagents",
+                    "title": "Sub-Agents",
+                    "icon": "resources/subagents.svg"
+                }
+            ]
+        },
+        "views": {
+            "subagents": [
+                {
+                    "id": "subagents.active",
+                    "name": "Active Sub-Agents"
+                },
+                {
+                    "id": "subagents.history",
+                    "name": "History"
+                }
+            ]
+        },
+        "commands": [
+            {
+                "command": "subagents.launch",
+                "title": "Launch Sub-Agents...",
+                "category": "Sub-Agents",
+                "icon": "$(rocket)"
+            },
+            {
+                "command": "subagents.launchQuick",
+                "title": "Quick Launch (Single Sub-Agent)",
+                "category": "Sub-Agents",
+                "icon": "$(play)"
+            },
+            {
+                "command": "subagents.cancelAll",
+                "title": "Cancel All Running Sub-Agents",
+                "category": "Sub-Agents",
+                "icon": "$(stop)"
+            },
+            {
+                "command": "subagents.cancel",
+                "title": "Cancel Sub-Agent",
+                "category": "Sub-Agents",
+                "icon": "$(close)"
+            },
+            {
+                "command": "subagents.viewChat",
+                "title": "View Sub-Agent Chat",
+                "category": "Sub-Agents",
+                "icon": "$(eye)"
+            },
+            {
+                "command": "subagents.refresh",
+                "title": "Refresh",
+                "category": "Sub-Agents",
+                "icon": "$(refresh)"
+            },
+            {
+                "command": "subagents.setupCDP",
+                "title": "Setup CDP (Sidebar Injection)",
+                "category": "Sub-Agents",
+                "icon": "$(settings-gear)"
+            },
+            {
+                "command": "subagents.openDevTools",
+                "title": "Open Manager DevTools",
+                "category": "Sub-Agents",
+                "icon": "$(browser)"
+            },
+            {
+                "command": "subagents.openSettings",
+                "title": "Open Sub-Agents Settings",
+                "category": "Sub-Agents",
+                "icon": "$(gear)"
+            },
+            {
+                "command": "subagents.checkHealth",
+                "title": "Check Extension Health",
+                "category": "Sub-Agents",
+                "icon": "$(heart)"
+            }
+        ],
+        "configuration": {
+            "title": "Sub-Agents",
+            "properties": {
+                "subagents.defaultModel": {
+                    "type": "string",
+                    "default": "flash",
+                    "enum": ["flash", "pro-low", "pro-high", "sonnet", "opus", "gpt"],
+                    "enumDescriptions": [
+                        "Gemini Flash — Fast, lightweight",
+                        "Gemini Pro (Low) — Balanced",
+                        "Gemini Pro (High) — High quality",
+                        "Claude Sonnet — Anthropic balanced",
+                        "Claude Opus — Anthropic premium",
+                        "GPT OSS — OpenAI OSS"
+                    ],
+                    "description": "Default model for sub-agents when not specified by the parent agent."
+                },
+                "subagents.cdpPort": {
+                    "type": "number",
+                    "default": 9347,
+                    "description": "Chrome DevTools Protocol port for sidebar injection. Must match the --remote-debugging-port flag."
+                },
+                "subagents.autoConnectCDP": {
+                    "type": "boolean",
+                    "default": true,
+                    "description": "Automatically connect to CDP on extension activation."
+                },
+                "subagents.autoInstallMCP": {
+                    "type": "boolean",
+                    "default": true,
+                    "description": "Automatically install the MCP server configuration on activation."
+                }
+            }
+        },
+        "menus": {
+            "view/title": [
+                {
+                    "command": "subagents.launch",
+                    "when": "view == subagents.active",
+                    "group": "navigation"
+                },
+                {
+                    "command": "subagents.cancelAll",
+                    "when": "view == subagents.active",
+                    "group": "navigation"
+                },
+                {
+                    "command": "subagents.refresh",
+                    "when": "view == subagents.active || view == subagents.history",
+                    "group": "navigation"
+                }
+            ],
+            "view/item/context": [
+                {
+                    "command": "subagents.viewChat",
+                    "when": "viewItem =~ /subagent/",
+                    "group": "inline"
+                },
+                {
+                    "command": "subagents.cancel",
+                    "when": "viewItem =~ /running|pending/",
+                    "group": "inline"
+                }
+            ]
+        }
+    },
+    "repository": {
+        "type": "git",
+        "url": "https://github.com/abdofallah/Antigravity-Sub-Agents.git"
+    },
+    "homepage": "https://github.com/abdofallah/Antigravity-Sub-Agents#readme",
+    "bugs": {
+        "url": "https://github.com/abdofallah/Antigravity-Sub-Agents/issues"
+    },
+    "license": "MIT",
+    "scripts": {
+        "build": "tsup",
+        "dev": "tsup --watch",
+        "package": "vsce package --no-dependencies",
+        "version:patch": "npm version patch --no-git-tag-version",
+        "version:minor": "npm version minor --no-git-tag-version",
+        "version:major": "npm version major --no-git-tag-version"
+    },
+    "dependencies": {
+        "antigravity-sdk": "file:vendor/antigravity-sdk"
+    },
+    "devDependencies": {
+        "@types/node": "^20.0.0",
+        "@types/vscode": "^1.85.0",
+        "tsup": "^8.0.0",
+        "typescript": "^5.0.0"
+    }
+}
