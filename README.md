@@ -5,6 +5,10 @@
 [![Release](https://github.com/abdofallah/Antigravity-Sub-Agents/actions/workflows/release.yml/badge.svg)](https://github.com/abdofallah/Antigravity-Sub-Agents/actions)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
+## Why?
+
+Alot of us are disappointed in the approach google has taken for 2.0... it could just have been as simple as this than a standalone manager and disconnected IDE.
+
 ## What Is This?
 
 Antigravity Sub-Agents is a VS Code extension that gives Antigravity IDE's AI agents the ability to **spawn child agents** that work in parallel. A parent agent can launch multiple sub-agents, each with their own conversation, and receive consolidated results when they finish.

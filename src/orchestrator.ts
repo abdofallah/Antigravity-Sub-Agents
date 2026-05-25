@@ -22,6 +22,9 @@ import {
     ILaunchConfig,
     IQuickLaunchConfig,
     ISubAgentEvent,
+    IBufferedMessage,
+    IMessageBuffer,
+    IPendingAction,
     SubAgentStatus,
     MODEL_LABELS,
     isActiveStatus,
@@ -38,6 +41,10 @@ export class Orchestrator implements vscode.Disposable {
     private readonly _agents = new Map<string, ISubAgent>();
     /** Batch registry — batchId → ISubAgentBatch */
     private readonly _batches = new Map<string, ISubAgentBatch>();
+    /** Message buffers — batchId → IMessageBuffer */
+    private readonly _messageBuffers = new Map<string, IMessageBuffer>();
+    /** Tracks batches that have already been delivered (prevent duplicates) */
+    private readonly _deliveredBatches = new Set<string>();
 
     /** Event emitter for sub-agent state changes */
     private readonly _onEvent = new vscode.EventEmitter<ISubAgentEvent>();
@@ -279,9 +286,23 @@ export class Orchestrator implements vscode.Disposable {
                 // Key differences from our old format:
                 //   - 'google' planner → full agentic mode with all tools/MCPs
                 //   - requestedModel uses model enum value
+                //
+                // Inject parentId + send_message instruction into the task prompt
+                // so the sub-agent knows HOW and WHERE to report results.
+                const augmentedTask = [
+                    `[Sub-Agent Context]`,
+                    `You are a sub-agent launched by a parent agent. Your parent's conversation ID is: ${parentId}`,
+                    `When you have completed your task, you MUST call the send_message tool to report your results back to the parent:`,
+                    `  send_message(parentId="${parentId}", message="<your findings and results>")`,
+                    `Your text output is NOT automatically sent to the parent — you MUST use send_message. Put ALL important information (findings, summaries, file paths, conclusions) into your send_message call.`,
+                    ``,
+                    `[Task]`,
+                    task,
+                ].join('\n');
+
                 const sendPayload: any = {
                     cascadeId,
-                    items: [{ text: task }],
+                    items: [{ text: augmentedTask }],
                     cascadeConfig: {
                         plannerConfig: {
                             // Proto3 oneof: 'google' = full agentic with tools
@@ -384,6 +405,8 @@ export class Orchestrator implements vscode.Disposable {
 
     /**
      * Cancel a running sub-agent (user-initiated).
+     * Silent — no report is sent to the parent agent.
+     * If the parent wants to know, it can call check_subagents.
      */
     async cancel(id: string): Promise<void> {
         const agent = this._agents.get(id);
@@ -398,9 +421,13 @@ export class Orchestrator implements vscode.Disposable {
         const prev = agent.status;
         agent.status = SubAgentStatus.Cancelled;
         agent.completedAt = Date.now();
-        agent.error = 'USER_CANCELLED: This sub-agent was explicitly stopped by the user. Do NOT relaunch or retry it.';
+        // No USER_CANCELLED prefix — silent cancellation matching AG 2.0 behavior
+        agent.error = 'Stopped by user';
         this._fire(agent, 'status_change', prev);
         this._persistState();
+
+        // Check if this completes a batch → trigger buffered delivery
+        this._checkBatchDelivery(agent.batchId);
     }
 
     /**
@@ -472,6 +499,137 @@ export class Orchestrator implements vscode.Disposable {
                 await this._delay(500);
                 await vscode.commands.executeCommand('antigravity.setVisibleConversation', id);
             }
+        }
+    }
+
+    // ─── Remote Action Handling ─────────────────────────────────────────
+
+    /**
+     * Approve (Run) a pending action on a sub-agent.
+     * Sends HandleCascadeUserInteraction with allow=true.
+     */
+    async approveAction(id: string): Promise<void> {
+        const agent = this._agents.get(id);
+        if (!agent || !agent.pendingAction) {
+            this._out.appendLine(`[APPROVE] ${id.substring(0, 8)}: no pending action`);
+            return;
+        }
+        const { trajectoryId, stepIndex, target } = agent.pendingAction;
+        this._out.appendLine(`[APPROVE] ${id.substring(0, 8)}: traj=${trajectoryId.substring(0, 8)}, step=${stepIndex}, target=${target}`);
+
+        try {
+            await this._sdk.ls.rawRPC('HandleCascadeUserInteraction', {
+                cascadeId: id,
+                interaction: {
+                    trajectoryId,
+                    stepIndex,
+                    permission: {
+                        allow: true,
+                        scope: 'PERMISSION_SCOPE_ONCE',
+                    },
+                },
+            });
+
+            // Clear pending action and revert to running
+            agent.pendingAction = undefined;
+            const prev = agent.status;
+            agent.status = SubAgentStatus.Running;
+            this._out.appendLine(`[APPROVE] ${id.substring(0, 8)}: action approved, status -> Running`);
+            this._fire(agent, 'status_change', prev);
+            this._persistState();
+        } catch (err: any) {
+            this._out.appendLine(`[APPROVE] ${id.substring(0, 8)}: FAILED: ${err?.message}`);
+        }
+    }
+
+    /**
+     * Respond "No" with a custom message — rejects the single permission
+     * but does NOT cancel the cascade, allowing the agent to adapt.
+     * Sends HandleCascadeUserInteraction with allow=false (deny scope),
+     * then sends a user message with the provided text.
+     */
+    async respondAction(id: string, message?: string): Promise<void> {
+        const agent = this._agents.get(id);
+        if (!agent || !agent.pendingAction) {
+            this._out.appendLine(`[RESPOND] ${id.substring(0, 8)}: no pending action`);
+            return;
+        }
+        const { trajectoryId, stepIndex, target } = agent.pendingAction;
+        const msg = message || 'No, do not run this command.';
+        this._out.appendLine(`[RESPOND] ${id.substring(0, 8)}: traj=${trajectoryId.substring(0, 8)}, step=${stepIndex}, msg="${msg}"`);
+
+        try {
+            // 1. Deny the permission (no "allow" field = reject)
+            await this._sdk.ls.rawRPC('HandleCascadeUserInteraction', {
+                cascadeId: id,
+                interaction: {
+                    trajectoryId,
+                    stepIndex,
+                    permission: {
+                        scope: 'PERMISSION_SCOPE_ONCE',
+                    },
+                },
+            });
+
+            // 2. Send user message so the agent knows what to do instead
+            await this._sdk.ls.rawRPC('SendUserCascadeMessage', {
+                cascadeId: id,
+                message: msg,
+            });
+
+            // Clear pending action and revert to running (agent continues)
+            agent.pendingAction = undefined;
+            const prev = agent.status;
+            agent.status = SubAgentStatus.Running;
+            this._out.appendLine(`[RESPOND] ${id.substring(0, 8)}: denied with message, status -> Running`);
+            this._fire(agent, 'status_change', prev);
+            this._persistState();
+        } catch (err: any) {
+            this._out.appendLine(`[RESPOND] ${id.substring(0, 8)}: FAILED: ${err?.message}`);
+        }
+    }
+
+    /**
+     * Reject (Cancel) — hard reject: denies the permission AND cancels the cascade entirely.
+     * Used from the sidebar quick-deny flow.
+     */
+    async rejectAction(id: string): Promise<void> {
+        const agent = this._agents.get(id);
+        if (!agent || !agent.pendingAction) {
+            this._out.appendLine(`[REJECT] ${id.substring(0, 8)}: no pending action`);
+            return;
+        }
+        const { trajectoryId, stepIndex, target } = agent.pendingAction;
+        this._out.appendLine(`[REJECT] ${id.substring(0, 8)}: traj=${trajectoryId.substring(0, 8)}, step=${stepIndex}, target=${target}`);
+
+        try {
+            // 1. Deny the permission
+            await this._sdk.ls.rawRPC('HandleCascadeUserInteraction', {
+                cascadeId: id,
+                interaction: {
+                    trajectoryId,
+                    stepIndex,
+                    permission: {
+                        scope: 'PERMISSION_SCOPE_ONCE',
+                    },
+                },
+            });
+
+            // 2. Cancel the cascade entirely
+            await this._sdk.ls.rawRPC('CancelCascadeInvocation', {
+                cascadeId: id,
+            });
+
+            // Mark as cancelled
+            agent.pendingAction = undefined;
+            const prev = agent.status;
+            agent.status = SubAgentStatus.Cancelled;
+            agent.completedAt = Date.now();
+            this._out.appendLine(`[REJECT] ${id.substring(0, 8)}: rejected & cancelled`);
+            this._fire(agent, 'cancelled', prev);
+            this._persistState();
+        } catch (err: any) {
+            this._out.appendLine(`[REJECT] ${id.substring(0, 8)}: FAILED: ${err?.message}`);
         }
     }
 
@@ -610,9 +768,22 @@ export class Orchestrator implements vscode.Disposable {
                             this._out.appendLine(`[DECISION] ${agent.id.substring(0, 8)}: waitingSteps -> WaitingForAction (was ${prev})`);
                             this._fire(agent, 'action_required', prev);
                         }
+
+                        // Extract pending action details for remote approve/reject
+                        if (!agent.pendingAction) {
+                            try {
+                                await this._extractPendingAction(agent, trajSummaries![agent.id]);
+                            } catch (err: any) {
+                                this._out.appendLine(`[ACTION] ${agent.id.substring(0, 8)}: failed to extract: ${err?.message}`);
+                            }
+                        }
+
                         this._staleCycles.set(agent.id, 0); // Reset stale — NOT stuck
                         this._lastStepCounts.set(agent.id, newSteps);
                         continue;
+                    } else if (agent.pendingAction) {
+                        // No longer waiting — clear the pending action
+                        agent.pendingAction = undefined;
                     }
 
                     if (trajStatus === 'CASCADE_RUN_STATUS_IDLE') {
@@ -673,6 +844,75 @@ export class Orchestrator implements vscode.Disposable {
         }
 
         this._persistState();
+    }
+
+    /**
+     * Extract pending action details from the trajectory summary's waitingSteps.
+     * We do NOT call getConversation (it 404s for these cascade IDs).
+     * Instead we extract everything from the trajectory summary directly.
+     */
+    private async _extractPendingAction(agent: ISubAgent, trajSummary: any): Promise<void> {
+        const waitingSteps = trajSummary?.waitingSteps;
+        if (!Array.isArray(waitingSteps) || waitingSteps.length === 0) return;
+
+        // Log full structure for debugging
+        this._out.appendLine(`[ACTION] ${agent.id.substring(0, 8)}: waitingSteps=${JSON.stringify(waitingSteps).substring(0, 500)}`);
+
+        const firstWaiting = waitingSteps[0];
+
+        // Extract trajectoryId — try multiple possible locations
+        const trajId = trajSummary?.trajectoryId
+            || firstWaiting?.trajectoryId
+            || agent.id; // ultimate fallback
+
+        // Extract stepIndex from the waiting step data
+        const stepIdx = firstWaiting?.stepIndex
+            ?? firstWaiting?.index
+            ?? firstWaiting?.step_index
+            ?? (typeof firstWaiting === 'number' ? firstWaiting : undefined);
+
+        // Try to extract action details from the waiting step object
+        let actionType = 'unknown';
+        let target = 'Needs approval';
+
+        if (firstWaiting && typeof firstWaiting === 'object') {
+            // Check for step type/content in the waiting step itself
+            const stepType = firstWaiting.type || firstWaiting.stepType || '';
+
+            if (stepType.includes('RUN_COMMAND') || firstWaiting.runCommand) {
+                actionType = 'command';
+                const cmd = firstWaiting.runCommand || firstWaiting.command || {};
+                target = cmd.commandLine || cmd.proposedCommandLine || cmd.CommandLine || 'command';
+            } else if (stepType.includes('CODE_ACTION') || firstWaiting.codeAction) {
+                actionType = 'edit';
+                target = 'file edit';
+            } else if (firstWaiting.requestedInteraction?.permission) {
+                const res = firstWaiting.requestedInteraction.permission.resource;
+                if (res) {
+                    actionType = res.action || 'unknown';
+                    target = res.target || 'Needs approval';
+                }
+            }
+
+            // Check for description/summary/title
+            if (target === 'Needs approval') {
+                target = firstWaiting.description
+                    || firstWaiting.summary
+                    || firstWaiting.title
+                    || firstWaiting.label
+                    || 'Needs approval';
+            }
+        }
+
+        agent.pendingAction = {
+            trajectoryId: trajId,
+            stepIndex: stepIdx !== undefined ? stepIdx : -1,
+            actionType,
+            target,
+        };
+
+        this._out.appendLine(`[ACTION] ${agent.id.substring(0, 8)}: pendingAction set: type=${actionType}, target="${target}", trajId=${trajId.substring(0, 8)}, step=${stepIdx ?? -1}`);
+        this._fire(agent, 'action_required');
     }
 
     /**
@@ -763,77 +1003,168 @@ export class Orchestrator implements vscode.Disposable {
     private _fire(agent: ISubAgent, type: ISubAgentEvent['type'], previousStatus?: SubAgentStatus): void {
         this._onEvent.fire({ agent, type, previousStatus });
 
-        // On completion, report result back to parent conversation
+        // On completion (by monitoring), check if batch delivery should trigger.
+        // This handles agents that complete WITHOUT calling send_message.
         if (type === 'completed') {
-            this._reportResultToParent(agent).catch(e =>
-                this._out.appendLine(`[REPORT] Error reporting result: ${e?.message}`));
+            // Store a fallback result from trajectory if agent didn't send_message
+            if (!agent.hasSentMessage) {
+                this._storeTrajectoryResult(agent).catch(e =>
+                    this._out.appendLine(`[REPORT] Error storing trajectory result: ${e?.message}`));
+            }
+            this._checkBatchDelivery(agent.batchId);
         }
     }
 
-    // ─── Result Reporting ───────────────────────────────────────────────
+    // ─── Messaging System ───────────────────────────────────────────────
 
     /**
-     * When a sub-agent completes, fetch its summary from the trajectory
-     * and send it as a message to the parent conversation.
-     * Also checks if the entire batch is done to send a batch summary.
+     * Receive a send_message call from a sub-agent.
+     * Buffers the message and checks if the batch is ready for delivery.
+     *
+     * Flow:
+     * 1. Sub-agent calls send_message MCP tool
+     * 2. MCP server → bridge → this method
+     * 3. Message is buffered per-batch
+     * 4. When ALL agents in the batch are terminal (completed/failed/cancelled)
+     *    AND at least one completed (sent a message), deliver consolidated report
      */
-    private async _reportResultToParent(agent: ISubAgent): Promise<void> {
-        if (!agent.parentId || agent.parentId === 'unknown') return;
+    async sendMessage(agentId: string, parentId: string, message: string): Promise<{ buffered: boolean; delivered: boolean }> {
+        // Find the agent by cascade ID
+        const agent = this._agents.get(agentId);
+        if (!agent) {
+            this._out.appendLine(`[MSG] send_message from unknown agent ${agentId.substring(0, 8)}`);
+            // Try to find by iterating — agent might have sent from a slightly different context
+            return { buffered: false, delivered: false };
+        }
 
-        // Get the sub-agent's trajectory summary
-        let summary = '';
-        try {
-            const trajs = await this._sdk.ls.listCascades();
-            if (trajs && trajs[agent.id]) {
-                summary = trajs[agent.id].summary || '';
-            }
-        } catch { /* noop */ }
-
-        agent.result = summary || `Completed with ${agent.stepCount} steps`;
+        // Mark agent as having sent a message
+        agent.hasSentMessage = true;
+        agent.result = message;
         this._persistState();
 
-        // Check if entire batch is now complete
-        const batchAgents = this.getByBatch(agent.batchId);
-        const allDone = batchAgents.every(a => isTerminalStatus(a.status));
+        const batchId = agent.batchId;
+        this._out.appendLine(`[MSG] send_message from ${agent.label} (${agentId.substring(0, 8)}) batch=${batchId.substring(0, 12)}`);
 
-        if (!allDone) {
-            // Individual agent done but batch not complete — don't message yet
-            this._out.appendLine(`[REPORT] ${agent.id.substring(0, 8)}: completed (batch not yet done, ${batchAgents.filter(a => isTerminalStatus(a.status)).length}/${batchAgents.length})`);
+        // Get or create message buffer for this batch
+        let buffer = this._messageBuffers.get(batchId);
+        if (!buffer) {
+            buffer = {
+                batchId,
+                parentId,
+                messages: [],
+                delivered: false,
+            };
+            this._messageBuffers.set(batchId, buffer);
+        }
+
+        // Add the message to the buffer
+        buffer.messages.push({
+            agentId,
+            parentId,
+            message,
+            timestamp: Date.now(),
+        });
+
+        this._out.appendLine(`[MSG] Buffered (${buffer.messages.length} messages in batch)`);
+
+        // Check if we can deliver now
+        const delivered = await this._checkBatchDelivery(batchId);
+        return { buffered: true, delivered };
+    }
+
+    /**
+     * Check if a batch is ready for consolidated delivery.
+     * Triggers when ALL agents are terminal AND at least one completed with a message.
+     */
+    private async _checkBatchDelivery(batchId: string): Promise<boolean> {
+        // Already delivered? Skip.
+        if (this._deliveredBatches.has(batchId)) return false;
+
+        const batchAgents = this.getByBatch(batchId);
+        if (batchAgents.length === 0) return false;
+
+        // All agents must be terminal
+        const allTerminal = batchAgents.every(a => isTerminalStatus(a.status));
+        if (!allTerminal) {
+            const terminalCount = batchAgents.filter(a => isTerminalStatus(a.status)).length;
+            this._out.appendLine(`[DELIVERY] Batch ${batchId.substring(0, 12)}: ${terminalCount}/${batchAgents.length} terminal — waiting`);
+            return false;
+        }
+
+        // At least one must have completed (not all cancelled/failed)
+        const hasCompleted = batchAgents.some(a => a.status === SubAgentStatus.Completed);
+        if (!hasCompleted) {
+            // All cancelled or failed — check if all parent-stopped (silent)
+            const allParentStopped = batchAgents.every(a =>
+                a.status === SubAgentStatus.Cancelled && a.error?.includes('PARENT_STOPPED')
+            );
+            if (allParentStopped) {
+                this._out.appendLine(`[DELIVERY] Batch ${batchId.substring(0, 12)}: all parent-stopped, skipping delivery`);
+                this._deliveredBatches.add(batchId);
+                return false;
+            }
+            // All user-cancelled or failed — still deliver a status report
+            this._out.appendLine(`[DELIVERY] Batch ${batchId.substring(0, 12)}: no completions, delivering status report`);
+        }
+
+        // Deliver!
+        this._deliveredBatches.add(batchId);
+        await this._deliverBatchReport(batchId, batchAgents);
+        return true;
+    }
+
+    /**
+     * Deliver consolidated batch report to the parent agent.
+     * Combines buffered send_message results with status info for non-reporting agents.
+     */
+    private async _deliverBatchReport(batchId: string, batchAgents: ISubAgent[]): Promise<void> {
+        const parentId = batchAgents[0]?.parentId;
+        if (!parentId || parentId === 'unknown') {
+            this._out.appendLine(`[DELIVERY] Batch ${batchId.substring(0, 12)}: no valid parentId, skipping`);
             return;
         }
 
-        // Entire batch is done — send consolidated result to parent
-        // Skip if all agents were cancelled because the parent was stopped
-        const allParentStopped = batchAgents.every(a =>
-            a.status === SubAgentStatus.Cancelled && a.error?.startsWith('PARENT_STOPPED')
-        );
-        if (allParentStopped) {
-            this._out.appendLine(`[REPORT] Batch ${agent.batchId}: all agents parent-stopped, skipping report`);
-            return;
-        }
+        const buffer = this._messageBuffers.get(batchId);
         const lines: string[] = [];
-        const hasCancelled = batchAgents.some(a => a.status === SubAgentStatus.Cancelled && a.error?.startsWith('USER_CANCELLED'));
+
         lines.push(`## Sub-Agent Batch Complete\n`);
+
+        const hasCancelled = batchAgents.some(a => a.status === SubAgentStatus.Cancelled);
         if (hasCancelled) {
-            lines.push(`> **Note**: Some agents were explicitly stopped by the user. Do NOT relaunch or retry cancelled agents.\n`);
+            lines.push(`> **Note**: Some agents were stopped. Do not relaunch cancelled agents unless asked.\n`);
         }
+
         for (const a of batchAgents) {
-            const isUserCancelled = a.status === SubAgentStatus.Cancelled && a.error?.startsWith('USER_CANCELLED');
-            const icon = a.status === SubAgentStatus.Completed ? '✅' : isUserCancelled ? '🛑' : '❌';
-            const resultText = isUserCancelled ? 'Stopped by user (do not retry)' : (a.result || a.error || 'No result');
+            const icon = a.status === SubAgentStatus.Completed ? '✅'
+                : a.status === SubAgentStatus.Cancelled ? '🚫'
+                : '❌';
+
             lines.push(`### ${icon} ${a.label}`);
-            lines.push(`- **Status**: ${a.status}${isUserCancelled ? ' (user-initiated)' : ''} | **Steps**: ${a.stepCount}`);
-            lines.push(`- **Result**: ${resultText}`);
+            lines.push(`- **Status**: ${a.status} | **Steps**: ${a.stepCount}`);
+
+            // Use buffered message if available, else trajectory result, else fallback
+            const bufferedMsg = buffer?.messages.find(m => m.agentId === a.id);
+            if (bufferedMsg) {
+                lines.push(`- **Result**: ${bufferedMsg.message}`);
+            } else if (a.result) {
+                lines.push(`- **Result**: ${a.result}`);
+            } else if (a.status === SubAgentStatus.Cancelled) {
+                lines.push(`- **Result**: Stopped`);
+            } else if (a.status === SubAgentStatus.Failed) {
+                lines.push(`- **Result**: Failed — ${a.error || 'Unknown error'}`);
+            } else {
+                lines.push(`- **Result**: Completed (no details reported)`);
+            }
             lines.push('');
         }
 
-        const batchSummary = lines.join('\n');
-        this._out.appendLine(`[REPORT] Batch ${agent.batchId} complete — sending to parent ${agent.parentId.substring(0, 8)}`);
+        const report = lines.join('\n');
+        this._out.appendLine(`[DELIVERY] Batch ${batchId.substring(0, 12)} → parent ${parentId.substring(0, 8)} (${batchAgents.length} agents)`);
 
         try {
             await this._sdk.ls.rawRPC('SendUserCascadeMessage', {
-                cascadeId: agent.parentId,
-                items: [{ text: batchSummary }],
+                cascadeId: parentId,
+                items: [{ text: report }],
                 cascadeConfig: {
                     plannerConfig: {
                         google: {},
@@ -841,9 +1172,29 @@ export class Orchestrator implements vscode.Disposable {
                     },
                 },
             });
-            this._out.appendLine(`[REPORT] Result sent to parent successfully`);
+            this._out.appendLine(`[DELIVERY] Report sent to parent successfully`);
         } catch (err: any) {
-            this._out.appendLine(`[REPORT] Failed to send result to parent: ${err?.message}`);
+            this._out.appendLine(`[DELIVERY] Failed to send report: ${err?.message}`);
+        }
+    }
+
+    /**
+     * For agents that complete without calling send_message,
+     * try to grab a result summary from their trajectory data.
+     */
+    private async _storeTrajectoryResult(agent: ISubAgent): Promise<void> {
+        if (agent.result) return; // Already has a result
+
+        try {
+            const trajs = await this._sdk.ls.listCascades();
+            if (trajs && trajs[agent.id]) {
+                agent.result = trajs[agent.id].summary || `Completed with ${agent.stepCount} steps`;
+            } else {
+                agent.result = `Completed with ${agent.stepCount} steps`;
+            }
+            this._persistState();
+        } catch {
+            agent.result = `Completed with ${agent.stepCount} steps`;
         }
     }
 

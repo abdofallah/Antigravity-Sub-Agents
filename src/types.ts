@@ -61,6 +61,57 @@ export interface ISubAgent {
     error?: string;
     /** Result summary from the sub-agent's trajectory */
     result?: string;
+    /** Whether this agent has sent a message via send_message MCP tool */
+    hasSentMessage?: boolean;
+    /** Pending action details when status is WaitingForAction */
+    pendingAction?: IPendingAction;
+}
+
+/**
+ * Details about a pending user interaction (command approval, file edit, etc.)
+ * Extracted from trajectory waiting steps and used for remote approve/reject.
+ */
+export interface IPendingAction {
+    /** The trajectory ID containing the waiting step */
+    trajectoryId: string;
+    /** Index of the waiting step within the trajectory */
+    stepIndex: number;
+    /** Type of action: 'command', 'edit', 'unknown' */
+    actionType: string;
+    /** Human-readable target (e.g. "Get-Date", "utils.ts") */
+    target: string;
+}
+
+// ─── Messaging ──────────────────────────────────────────────────────────
+
+/**
+ * A message buffered from a sub-agent's send_message call.
+ * Messages are held until the entire batch is terminal.
+ */
+export interface IBufferedMessage {
+    /** The sub-agent that sent this message */
+    agentId: string;
+    /** The target parent cascade ID */
+    parentId: string;
+    /** The message content */
+    message: string;
+    /** When the message was received */
+    timestamp: number;
+}
+
+/**
+ * Per-batch message buffer. Collects send_message calls
+ * and delivers a consolidated report when all agents are terminal.
+ */
+export interface IMessageBuffer {
+    /** Batch ID this buffer belongs to */
+    batchId: string;
+    /** Parent cascade ID to deliver to */
+    parentId: string;
+    /** Buffered messages from sub-agents */
+    messages: IBufferedMessage[];
+    /** Whether the consolidated report has been delivered */
+    delivered: boolean;
 }
 
 /**

@@ -262,6 +262,16 @@ export class CdpSidebarInjector implements vscode.Disposable {
                     }
                 }
 
+                // Register CDP binding for approve/reject actions from the page
+                try {
+                    await this._cdpCall('Runtime.addBinding', { name: '__saActionHandler' });
+                    log('Action binding registered');
+                } catch (err: any) {
+                    if (!err?.message?.includes('already exists')) {
+                        log(`Action binding failed: ${err?.message}`);
+                    }
+                }
+
                 this._startRefreshLoop();
                 this._startHeartbeat();
                 this._startTargetRescan();
@@ -306,6 +316,21 @@ export class CdpSidebarInjector implements vscode.Disposable {
                                 for (const pid of parentIds) {
                                     this._orchestrator.cancelByParent(pid);
                                 }
+                            }
+                        } catch { }
+                    }
+
+                    // Handle Runtime.bindingCalled - approve/reject actions from the page
+                    if (msg.method === 'Runtime.bindingCalled' && msg.params?.name === '__saActionHandler') {
+                        try {
+                            const data = JSON.parse(msg.params.payload || '{}');
+                            log(`Action handler: type=${data.type}, id=${data.id || 'n/a'}, msg=${data.message || ''}`);
+                            if (data.type === 'approve' && data.id) {
+                                this._orchestrator.approveAction(data.id);
+                            } else if (data.type === 'respond' && data.id) {
+                                this._orchestrator.respondAction(data.id, data.message || undefined);
+                            } else if (data.type === 'reject' && data.id) {
+                                this._orchestrator.rejectAction(data.id);
                             }
                         } catch { }
                     }
@@ -470,18 +495,32 @@ export class CdpSidebarInjector implements vscode.Disposable {
             isActive: isActiveStatus(agent.status),
             completedAt: agent.completedAt || 0,
             createdAt: agent.createdAt,
+            pendingAction: agent.pendingAction ? {
+                actionType: agent.pendingAction.actionType,
+                target: agent.pendingAction.target.length > 40
+                    ? agent.pendingAction.target.substring(0, 37) + '...'
+                    : agent.pendingAction.target,
+            } : null,
         }));
 
         const dataJson = JSON.stringify(agentData);
-        const dataHash = agentData.map(a => `${a.id}:${a.status}:${a.steps}:${a.isActive}`).join('|');
+        const dataHash = agentData.map(a => `${a.id}:${a.status}:${a.steps}:${a.isActive}:${a.pendingAction?.target || ''}`).join('|');
 
-        // Build sets for chatbox blocking:
-        // - subAgentIds: all cascade IDs that are sub-agents (never allow chat input)
-        // - activeParentIds: parent IDs that have active sub-agents (block until done)
+        // - subAgentIds: all cascade IDs that are sub-agents (for cosmetic tweaks like archive banner)
         const subAgentIds = agents.map(a => a.id);
-        const activeParentIds = [...new Set(
-            agents.filter(a => isActiveStatus(a.status)).map(a => a.parentId)
-        )];
+
+        // Pending actions map — for cosmetic watcher to render action buttons on archive banner
+        const pendingActionsMap: Record<string, { actionType: string; target: string }> = {};
+        for (const agent of agents) {
+            if (agent.pendingAction) {
+                pendingActionsMap[agent.id] = {
+                    actionType: agent.pendingAction.actionType,
+                    target: agent.pendingAction.target.length > 50
+                        ? agent.pendingAction.target.substring(0, 47) + '...'
+                        : agent.pendingAction.target,
+                };
+            }
+        }
 
         // --- Build injection script ---
         // Phase 1: Ensure #sa-section shell exists (created once)
@@ -494,7 +533,7 @@ export class CdpSidebarInjector implements vscode.Disposable {
                 var LIMIT = ${VISIBLE_LIMIT};
                 var dataHash = '${dataHash}';
                 var subAgentIds = ${JSON.stringify(subAgentIds)};
-                var activeParentIds = ${JSON.stringify(activeParentIds)};
+                var pendingActions = ${JSON.stringify(pendingActionsMap)};
                 var debug = {};
 
                 if (!window.__saState) window.__saState = {};
@@ -585,6 +624,30 @@ export class CdpSidebarInjector implements vscode.Disposable {
                     b.addEventListener('mouseenter', function() { b.style.opacity = '1'; });
                     b.addEventListener('mouseleave', function() { b.style.opacity = '0.7'; });
                     b.addEventListener('click', function(e) { e.stopPropagation(); cancelAction(type, id); });
+                    return b;
+                }
+
+                // Action handler — calls CDP binding for approve/respond/reject
+                function actionHandler(type, id, message) {
+                    try { window.__saActionHandler(JSON.stringify({ type: type, id: id, message: message || '' })); } catch(e) { console.warn('Action failed', e); }
+                }
+
+                // Build action button helper (approve/deny style)
+                function actionBtn(text, type, id, color, bgColor) {
+                    var b = el('span', '');
+                    b.textContent = text;
+                    b.style.cssText = 'cursor:pointer;color:' + color + ';background:' + bgColor + ';font-size:11px;font-weight:500;padding:2px 10px;border-radius:4px;transition:opacity 0.15s,filter 0.15s;flex-shrink:0;user-select:none;';
+                    b.addEventListener('mouseenter', function() { b.style.filter = 'brightness(1.2)'; });
+                    b.addEventListener('mouseleave', function() { b.style.filter = ''; });
+                    b.addEventListener('click', function(e) {
+                        e.stopPropagation();
+                        if (type === 'respond') {
+                            var msg = prompt('Tell the agent what to do instead:');
+                            if (msg !== null) actionHandler('respond', id, msg);
+                        } else {
+                            actionHandler(type, id);
+                        }
+                    });
                     return b;
                 }
 
@@ -683,22 +746,60 @@ export class CdpSidebarInjector implements vscode.Disposable {
 
                 // Build an agent row (shared between solo and batch agents)
                 function buildAgentRow(a, inBatch) {
+                    if (a.status === 'waiting_for_action') {
+                        // ── Waiting agent: show label + task desc + Approve/Deny buttons ──
+                        var wrapper = el('div', '');
+                        wrapper.style.cssText = 'padding:4px 6px;border-radius:6px;background:rgba(251,191,36,0.08);border:1px solid rgba(251,191,36,0.15);margin:2px 0;' + (inBatch ? 'margin-left:16px;' : '');
+
+                        // Top row: icon + label + view link
+                        var topRow = el('div', 'flex items-center gap-2');
+                        topRow.style.cssText = 'margin-bottom:4px;cursor:pointer;';
+                        var bell = el('span', 'google-symbols');
+                        bell.textContent = 'notifications';
+                        bell.style.cssText = 'display:flex;align-items:center;justify-content:center;font-size:13px;color:#fbbf24;animation:' + P + '-pulse 1.5s ease-in-out infinite;';
+                        topRow.appendChild(bell);
+
+                        var nameSpan = el('span', 'text-sm truncate flex-1');
+                        nameSpan.textContent = a.label;
+                        nameSpan.style.cssText = 'color:#fbbf24;font-weight:500;';
+                        topRow.appendChild(nameSpan);
+
+                        // View icon (open in chat)
+                        var viewIcon = el('span', 'google-symbols');
+                        viewIcon.textContent = 'open_in_new';
+                        viewIcon.style.cssText = 'display:flex;align-items:center;font-size:12px;opacity:0.5;cursor:pointer;';
+                        viewIcon.addEventListener('click', function(e) { e.stopPropagation(); var rt = window.__TSR_ROUTER__; if (rt && rt.navigate) rt.navigate({ to: '/c/' + a.id }); });
+                        topRow.appendChild(viewIcon);
+
+                        topRow.addEventListener('click', function(e) { if (e.target === viewIcon) return; var rt = window.__TSR_ROUTER__; if (rt && rt.navigate) rt.navigate({ to: '/c/' + a.id }); });
+                        wrapper.appendChild(topRow);
+
+                        // Task description (from pending action or task)
+                        if (a.pendingAction) {
+                            var desc = el('div', 'text-xs truncate');
+                            desc.style.cssText = 'opacity:0.6;margin-bottom:6px;padding-left:21px;font-family:monospace;';
+                            desc.textContent = (a.pendingAction.actionType === 'command' ? 'Run ' : '') + a.pendingAction.target;
+                            wrapper.appendChild(desc);
+                        }
+
+                        // Action buttons row: Approve + Deny
+                        var btnRow = el('div', 'flex items-center gap-2');
+                        btnRow.style.cssText = 'padding-left:21px;';
+                        btnRow.appendChild(actionBtn('Approve', 'approve', a.id, '#fff', '#2563eb'));
+                        btnRow.appendChild(actionBtn('Deny', 'reject', a.id, '#fff', 'rgba(239,68,68,0.8)'));
+                        wrapper.appendChild(btnRow);
+
+                        return wrapper;
+                    }
+
+                    // ── Running agent: standard row ──
                     var r = el('div', 'flex items-center gap-2 py-0.5 group');
                     r.style.cssText = 'cursor:pointer;opacity:0.8;transition:opacity 0.15s;' + (inBatch ? 'padding-left:20px;' : '');
                     r.addEventListener('mouseenter', function() { r.style.opacity = '1'; r.querySelector('.' + P + '-row-stop').style.display = 'inline'; });
                     r.addEventListener('mouseleave', function() { r.style.opacity = '0.8'; r.querySelector('.' + P + '-row-stop').style.display = 'none'; });
 
-                    if (a.status === 'waiting_for_action') {
-                        var bell = el('span', 'google-symbols');
-                        bell.textContent = 'notifications';
-                        bell.style.cssText = 'display:flex;align-items:center;justify-content:center;font-size:14px;color:#fbbf24;animation:' + P + '-pulse 1.5s ease-in-out infinite;';
-                        r.appendChild(bell);
-                        r.appendChild(el('span', 'text-sm truncate flex-1', a.label));
-                        r.style.color = '#fbbf24';
-                    } else {
-                        r.appendChild(el('span', P + '-spinner'));
-                        r.appendChild(el('span', 'text-sm truncate flex-1', a.label));
-                    }
+                    r.appendChild(el('span', P + '-spinner'));
+                    r.appendChild(el('span', 'text-sm truncate flex-1', a.label));
 
                     // Per-agent stop button (visible on hover)
                     var agentStop = stopBtn('', 'agent', a.id, true);
@@ -724,16 +825,15 @@ export class CdpSidebarInjector implements vscode.Disposable {
                     }
                 }
 
-                // --- Chatbox blocking + undo removal (persistent watcher) ---
+                // --- Sub-agent chat cosmetic tweaks (persistent watcher) ---
                 // Install a persistent watcher that continuously enforces restrictions.
                 // This solves the race where React hasn't rendered the DOM yet.
                 if (!window.__saLockWatcher) {
-                    window.__saLockWatcher = { subAgentIds: [], activeParentIds: [], activeCount: 0 };
+                    window.__saLockWatcher = { subAgentIds: [], pendingActions: {} };
                 }
                 // Update the watcher's data on every injection cycle
                 window.__saLockWatcher.subAgentIds = subAgentIds;
-                window.__saLockWatcher.activeParentIds = activeParentIds;
-                window.__saLockWatcher.activeCount = activeCount;
+                window.__saLockWatcher.pendingActions = pendingActions;
 
                 if (!window.__saLockWatcherInstalled) {
                     window.__saLockWatcherInstalled = true;
@@ -758,111 +858,114 @@ export class CdpSidebarInjector implements vscode.Disposable {
                         if (!convoId) return;
 
                         var isSub = w.subAgentIds.indexOf(convoId) !== -1;
-                        var isParent = w.activeParentIds.indexOf(convoId) !== -1;
 
-                        // Hide revert buttons + replace archive banner on sub-agent chats
                         if (isSub) {
+                            // Hide revert/undo buttons on sub-agent chats
                             var revertBtns = document.querySelectorAll('[data-testid="revert-button"]');
                             revertBtns.forEach(function(btn) { btn.style.display = 'none'; });
 
-                            // Replace "This chat is archived" banner with locked message
-                            // We overlay instead of replacing innerHTML because React re-renders children
-                            var allSpans = document.querySelectorAll('span.text-sm.opacity-70');
-                            allSpans.forEach(function(sp) {
-                                if (sp.textContent && sp.textContent.indexOf('archived') !== -1) {
-                                    var banner = sp.parentElement;
-                                    if (banner) {
-                                        // Hide all original children
-                                        for (var ci = 0; ci < banner.childNodes.length; ci++) {
-                                            var ch = banner.childNodes[ci];
-                                            if (ch.nodeType === 1 && ch.id !== P + '-lock-banner') {
-                                                ch.style.display = 'none';
+                            var action = w.pendingActions && w.pendingActions[convoId];
+
+                            // Find the archive banner container
+                            var bannerContainer = document.querySelector('.relative.flex.items-center.justify-center.gap-2.p-1');
+                            if (!bannerContainer) {
+                                // Also check for the input box area when chat is unarchived
+                                var inputArea = document.getElementById('antigravity.agentSidePanelInputBox');
+                                if (inputArea && action) bannerContainer = inputArea;
+                            }
+
+                            if (bannerContainer && action && !document.getElementById(P + '-action-bar')) {
+                                // ── Pending action: replace the entire banner with action UI ──
+                                // Hide original children but keep container
+                                var origChildren = bannerContainer.children;
+                                for (var ci = 0; ci < origChildren.length; ci++) {
+                                    origChildren[ci].style.display = 'none';
+                                }
+
+                                var actionBar = document.createElement('div');
+                                actionBar.id = P + '-action-bar';
+                                actionBar.style.cssText = 'display:flex;flex-direction:column;gap:6px;width:100%;padding:8px 12px;';
+
+                                // Top: icon + description
+                                var topLine = document.createElement('div');
+                                topLine.style.cssText = 'display:flex;align-items:center;gap:8px;';
+
+                                var lockIcon = document.createElement('span');
+                                lockIcon.textContent = String.fromCodePoint(0x1F512);
+                                lockIcon.style.cssText = 'font-size:14px;flex-shrink:0;';
+                                topLine.appendChild(lockIcon);
+
+                                var descText = document.createElement('span');
+                                descText.style.cssText = 'font-size:13px;opacity:0.85;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;';
+                                var prefix = action.actionType === 'command' ? 'Allow running ' : 'Allow ';
+                                descText.textContent = prefix + action.target + '?';
+                                topLine.appendChild(descText);
+
+                                actionBar.appendChild(topLine);
+
+                                // Bottom: action buttons
+                                var btnLine = document.createElement('div');
+                                btnLine.style.cssText = 'display:flex;align-items:center;gap:8px;padding-left:22px;';
+
+                                function makeActionBtn(text, type, bgColor, textColor) {
+                                    var b = document.createElement('button');
+                                    b.textContent = text;
+                                    b.style.cssText = 'cursor:pointer;border:none;border-radius:4px;padding:3px 14px;font-size:12px;font-weight:500;color:' + textColor + ';background:' + bgColor + ';transition:filter 0.15s;';
+                                    b.addEventListener('mouseenter', function() { b.style.filter = 'brightness(1.2)'; });
+                                    b.addEventListener('mouseleave', function() { b.style.filter = ''; });
+                                    b.addEventListener('click', function(e) {
+                                        e.stopPropagation();
+                                        if (type === 'respond') {
+                                            var msg = prompt('Tell the agent what to do instead:');
+                                            if (msg !== null) {
+                                                try { window.__saActionHandler(JSON.stringify({ type: 'respond', id: convoId, message: msg })); } catch(ex) {}
                                             }
+                                        } else {
+                                            try { window.__saActionHandler(JSON.stringify({ type: type, id: convoId })); } catch(ex) {}
                                         }
-                                        // Add our overlay if not already there
-                                        if (!document.getElementById(P + '-lock-banner')) {
-                                            banner.style.position = 'relative';
-                                            var lb = document.createElement('div');
-                                            lb.id = P + '-lock-banner';
-                                            lb.style.cssText = 'position:absolute;inset:0;display:flex;align-items:center;justify-content:center;gap:8px;border-radius:8px;background:rgba(30,30,30,0.95);z-index:10;';
-                                            var lkIcon = document.createElement('span');
-                                            lkIcon.className = 'google-symbols';
-                                            lkIcon.textContent = 'lock';
-                                            lkIcon.style.cssText = 'font-size:18px;color:#888;';
-                                            lb.appendChild(lkIcon);
-                                            var lkText = document.createElement('span');
-                                            lkText.textContent = 'Sub-agent chat \u2014 view only';
-                                            lkText.style.cssText = 'font-size:13px;color:#888;';
-                                            lb.appendChild(lkText);
-                                            banner.appendChild(lb);
-                                        }
+                                    });
+                                    return b;
+                                }
+
+                                btnLine.appendChild(makeActionBtn('Run', 'approve', '#2563eb', '#fff'));
+                                btnLine.appendChild(makeActionBtn('No', 'respond', 'rgba(120,120,120,0.3)', '#ccc'));
+                                btnLine.appendChild(makeActionBtn('Reject', 'reject', 'rgba(239,68,68,0.8)', '#fff'));
+
+                                actionBar.appendChild(btnLine);
+                                bannerContainer.appendChild(actionBar);
+
+                            } else if (bannerContainer && !action) {
+                                // ── No pending action: clean up action bar if it exists ──
+                                var existingBar = document.getElementById(P + '-action-bar');
+                                if (existingBar) {
+                                    existingBar.remove();
+                                    // Restore original children
+                                    var restoredChildren = bannerContainer.children;
+                                    for (var ri = 0; ri < restoredChildren.length; ri++) {
+                                        restoredChildren[ri].style.display = '';
                                     }
                                 }
-                            });
+
+                                // Replace "archived" text with view-only label
+                                var allSpans = document.querySelectorAll('span.text-sm.opacity-70');
+                                allSpans.forEach(function(sp) {
+                                    if (sp.textContent && sp.textContent.indexOf('archived') !== -1) {
+                                        sp.textContent = String.fromCodePoint(0x1F512) + ' Sub-agent chat ' + String.fromCharCode(0x2014) + ' view only';
+                                    }
+                                });
+                            }
                         }
 
-                        // Ensure overlay exists on input box
-                        var inputBox = document.getElementById('antigravity.agentSidePanelInputBox');
-                        if (!inputBox) return;
-                        var bgInput = inputBox.querySelector('.bg-input');
-                        if (!bgInput) return;
-
-                        var existingOverlay = document.getElementById(P + '-input-overlay');
-
-                        if (isSub) {
-                            if (!existingOverlay) {
-                                bgInput.style.position = 'relative';
-                                var ov = document.createElement('div');
-                                ov.id = P + '-input-overlay';
-                                ov.style.cssText = 'position:absolute;inset:0;z-index:100;display:flex;align-items:center;justify-content:center;gap:8px;background:rgba(20,20,20,0.85);border-radius:12px;cursor:not-allowed;backdrop-filter:blur(2px);';
-
-                                var lk = document.createElement('span');
-                                lk.className = 'google-symbols';
-                                lk.textContent = 'lock';
-                                lk.style.cssText = 'font-size:16px;color:#888;';
-                                ov.appendChild(lk);
-                                var lt = document.createElement('span');
-                                lt.textContent = 'Sub-agent chat \u2014 view only';
-                                ov.appendChild(lt);
-                                ov.style.color = '#888';
-                                ov.style.fontSize = '13px';
-                                bgInput.appendChild(ov);
-                            }
-                        } else if (isParent) {
-                            if (!existingOverlay) {
-                                bgInput.style.position = 'relative';
-                                var ov2 = document.createElement('div');
-                                ov2.id = P + '-input-overlay';
-                                ov2.style.cssText = 'position:absolute;inset:0;z-index:100;display:flex;align-items:center;justify-content:center;gap:8px;background:rgba(20,20,20,0.85);border-radius:12px;cursor:not-allowed;backdrop-filter:blur(2px);';
-
-                                var sp2 = document.createElement('span');
-                                sp2.className = P + '-spinner';
-                                sp2.style.cssText = 'width:14px;height:14px;';
-                                ov2.appendChild(sp2);
-                                var mg2 = document.createElement('span');
-                                mg2.textContent = w.activeCount + ' sub-agent' + (w.activeCount > 1 ? 's' : '') + ' running...';
-                                mg2.style.cssText = 'color:#aaa;font-size:13px;';
-                                ov2.appendChild(mg2);
-                                var sb2 = document.createElement('span');
-                                sb2.textContent = 'Stop All & Don\u2019t Report';
-                                sb2.style.cssText = 'cursor:pointer;color:#ef4444;font-size:12px;padding:2px 10px;border:1px solid rgba(239,68,68,0.4);border-radius:6px;opacity:0.85;transition:opacity 0.15s;';
-                                sb2.addEventListener('mouseenter', function() { sb2.style.opacity = '1'; });
-                                sb2.addEventListener('mouseleave', function() { sb2.style.opacity = '0.85'; });
-                                sb2.addEventListener('click', function(e) { e.stopPropagation(); try { window.__saCancelAction(JSON.stringify({type:'silent',id:''})); } catch(x){} });
-                                ov2.appendChild(sb2);
-                                bgInput.appendChild(ov2);
-                            }
-                        } else {
-                            // Not a locked chat — remove overlay if present
-                            if (existingOverlay) existingOverlay.remove();
-                        }
+                        // Clean up any legacy overlays from previous versions
+                        var legacyOverlay = document.getElementById(P + '-input-overlay');
+                        if (legacyOverlay) legacyOverlay.remove();
+                        var legacyBanner = document.getElementById(P + '-lock-banner');
+                        if (legacyBanner) legacyBanner.remove();
                     }
 
-                    // Run immediately + on interval + on DOM changes
+                    // Run immediately + on interval
                     enforceLocks();
                     setInterval(enforceLocks, 500);
-                    var obs = new MutationObserver(enforceLocks);
-                    obs.observe(document.body, { childList: true, subtree: true });
                 }
 
                 // ========================================

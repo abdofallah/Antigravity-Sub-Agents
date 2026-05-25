@@ -231,6 +231,24 @@ const TOOLS = [
             required: ['batchId'],
         },
     },
+    {
+        name: 'send_message',
+        description: 'Send a message to the parent agent that launched you. Use this to report your results, findings, and conclusions when you have completed your task. IMPORTANT: Your text output is NOT automatically sent to the parent — you MUST call this tool to communicate. Include all important information (findings, summaries, file paths, conclusions) in your message.',
+        inputSchema: {
+            type: 'object',
+            properties: {
+                parentId: {
+                    type: 'string',
+                    description: 'The conversation ID of the parent agent (provided in your task context)',
+                },
+                message: {
+                    type: 'string',
+                    description: 'The message content to send. Include all findings, summaries, file paths, and conclusions.',
+                },
+            },
+            required: ['parentId', 'message'],
+        },
+    },
 ];
 
 // Handle MCP messages
@@ -270,6 +288,8 @@ rl.on('line', async (line) => {
                     result = await bridgeRequest('POST', '/get-agent', args);
                 } else if (toolName === 'get_batch') {
                     result = await bridgeRequest('POST', '/get-batch', args);
+                } else if (toolName === 'send_message') {
+                    result = await bridgeRequest('POST', '/send-message', args);
                 } else {
                     result = { error: 'Unknown tool: ' + toolName };
                 }
@@ -325,6 +345,14 @@ rl.on('line', async (line) => {
                 result = this._handleGetAgent(body);
             } else if (req.method === 'POST' && req.url === '/get-batch') {
                 result = this._handleGetBatch(body);
+            } else if (req.method === 'POST' && req.url === '/send-message') {
+                result = await this._handleSendMessage(body);
+            } else if (req.method === 'POST' && req.url === '/approve-action') {
+                result = await this._handleApproveAction(body);
+            } else if (req.method === 'POST' && req.url === '/respond-action') {
+                result = await this._handleRespondAction(body);
+            } else if (req.method === 'POST' && req.url === '/reject-action') {
+                result = await this._handleRejectAction(body);
             } else if (req.method === 'GET' && req.url === '/health') {
                 result = { status: 'ok', activeCount: this._orchestrator.activeCount };
             } else {
@@ -381,9 +409,87 @@ rl.on('line', async (line) => {
         return {
             success: true,
             cancelled: true,
-            cancelledByUser: true,
-            message: `Sub-agent ${id} was stopped by the user. This cancellation is intentional — do NOT relaunch or retry this agent.`,
+            message: `Sub-agent ${id} has been stopped.`,
         };
+    }
+
+    private async _handleSendMessage(body: any): Promise<any> {
+        const { parentId, message } = body;
+        if (!parentId) return { error: 'No parentId provided' };
+        if (!message) return { error: 'No message provided' };
+
+        // Detect senderId from the agents that match this parentId
+        // The MCP server doesn't know its own cascade ID, but we can try
+        // to find it from context. For now, we look for the most recently
+        // active agent belonging to this parent.
+        const agentId = body.agentId || this._detectSenderAgent(parentId);
+        if (!agentId) {
+            return {
+                error: 'Could not determine which sub-agent is sending this message. '
+                    + 'Make sure the parentId is correct.',
+            };
+        }
+
+        const result = await this._orchestrator.sendMessage(agentId, parentId, message);
+        return {
+            success: true,
+            buffered: result.buffered,
+            delivered: result.delivered,
+            message: result.delivered
+                ? 'Message delivered to parent agent (batch complete).'
+                : 'Message buffered. Will be delivered when all agents in the batch finish.',
+        };
+    }
+
+    private async _handleApproveAction(body: any): Promise<any> {
+        const id = body.id;
+        if (!id) return { error: 'No id provided' };
+        await this._orchestrator.approveAction(id);
+        return { success: true, message: `Action approved for ${id}` };
+    }
+
+    private async _handleRespondAction(body: any): Promise<any> {
+        const id = body.id;
+        if (!id) return { error: 'No id provided' };
+        await this._orchestrator.respondAction(id, body.message);
+        return { success: true, message: `Responded to ${id}` };
+    }
+
+    private async _handleRejectAction(body: any): Promise<any> {
+        const id = body.id;
+        if (!id) return { error: 'No id provided' };
+        await this._orchestrator.rejectAction(id);
+        return { success: true, message: `Action rejected for ${id}` };
+    }
+
+    /**
+     * Try to detect which sub-agent is calling send_message.
+     * Since the MCP server runs per-LS (not per-cascade), we use heuristics:
+     * - Find running agents that belong to this parentId
+     * - If only one is running, it must be the sender
+     * - If multiple are running, pick the one without a message yet
+     */
+    private _detectSenderAgent(parentId: string): string | null {
+        const agents = this._orchestrator.getAll()
+            .filter(a => a.parentId === parentId);
+
+        // Active agents (running/waiting) that haven't sent a message yet
+        const candidates = agents.filter(a =>
+            isActiveStatus(a.status) && !a.hasSentMessage
+        );
+
+        if (candidates.length === 1) return candidates[0].id;
+
+        // If multiple candidates, prefer the one that's been running longest
+        // (it's most likely to be done and sending results)
+        if (candidates.length > 1) {
+            candidates.sort((a, b) => a.createdAt - b.createdAt);
+            return candidates[0].id;
+        }
+
+        // Fallback: any agent with this parent that hasn't sent a message
+        const fallback = agents.find(a => !a.hasSentMessage);
+        return fallback?.id || null;
     }
 
     private _handleStatus(): any {
@@ -425,7 +531,6 @@ rl.on('line', async (line) => {
     }
 
     private _formatAgent(a: any): any {
-        const isCancelledByUser = a.status === 'cancelled' && a.error?.startsWith('USER_CANCELLED');
         return {
             id: a.id,
             label: a.label,
@@ -438,8 +543,7 @@ rl.on('line', async (line) => {
             createdAt: new Date(a.createdAt).toISOString(),
             completedAt: a.completedAt ? new Date(a.completedAt).toISOString() : null,
             error: a.error || null,
-            cancelledByUser: isCancelledByUser,
-            ...(isCancelledByUser ? { userCancelled: 'This agent was explicitly stopped by the user. Do NOT relaunch, retry, or re-attempt this task.' } : {}),
+            hasSentMessage: a.hasSentMessage || false,
         };
     }
 
