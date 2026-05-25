@@ -9,6 +9,7 @@
  * - MCP Bridge (agent-triggered launches)
  * - CDP Injector (sidebar DOM injection)
  * - Commands (VS Code command palette)
+ * - Simulation (dev-only, gated by __DEV__ + devMode setting)
  *
  * Startup flow:
  * 1. Initialize SDK & LS Bridge
@@ -17,9 +18,13 @@
  * 4. Start CDP → report status & guide if unavailable
  * 5. Register commands
  * 6. Start status polling
+ * 7. (Dev) Register simulation panel if devMode enabled
  *
  * @module extension
  */
+
+/** Build-time flag — true in dev, false in release (dead-code eliminated) */
+declare const __DEV__: boolean;
 
 import * as vscode from 'vscode';
 import * as path from 'path';
@@ -232,6 +237,16 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         activeTree, historyTree, statusTree,
         sdk, mcpPort, log,
     );
+
+    // ─── Simulation Panel (Dev Only) ─────────────────────────────────
+    if (__DEV__) {
+        const devMode = getConfig().get<boolean>('devMode', false);
+        if (devMode) {
+            const { registerSimulationPanel } = await import('./simulation');
+            registerSimulationPanel(context, orchestrator);
+            log('🧪 Simulation panel registered (devMode enabled)');
+        }
+    }
 
     log('✅ Extension activated');
 }

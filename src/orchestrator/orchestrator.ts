@@ -52,6 +52,8 @@ export class Orchestrator implements vscode.Disposable {
     private readonly _messageBuffers = new Map<string, IMessageBuffer>();
     /** Tracks batches that have already been delivered (prevent duplicates) */
     private readonly _deliveredBatches = new Set<string>();
+    /** Tracks simulated agent/batch IDs (dev only, never persisted) */
+    private readonly _simulatedIds = new Set<string>();
 
     /** Event emitter for sub-agent state changes */
     private readonly _onEvent = new vscode.EventEmitter<ISubAgentEvent>();
@@ -307,8 +309,9 @@ export class Orchestrator implements vscode.Disposable {
     // ─── Persistence ────────────────────────────────────────────────────
 
     private _persistState(): void {
-        const agents = Array.from(this._agents.values());
-        const batches = Array.from(this._batches.values());
+        // Never persist simulated agents (ephemeral dev-only fakes)
+        const agents = Array.from(this._agents.values()).filter(a => !this._simulatedIds.has(a.id));
+        const batches = Array.from(this._batches.values()).filter(b => !this._simulatedIds.has(b.id));
         this._context.globalState.update('subagents.agents', agents);
         this._context.globalState.update('subagents.batches', batches);
     }
@@ -330,6 +333,83 @@ export class Orchestrator implements vscode.Disposable {
         for (const b of batches) {
             this._batches.set(b.id, b);
         }
+    }
+
+    // ─── Simulation API (Dev Only) ──────────────────────────────────────
+
+    /**
+     * Inject a fake sub-agent directly into the store.
+     * Fires a 'created' event so all UI updates instantly.
+     * These agents are NEVER persisted — purely ephemeral.
+     * The agent can have any ID (including real cascade IDs for testing).
+     */
+    __injectSimulatedAgent(agent: ISubAgent): void {
+        // Prevent collisions with real agents
+        if (this._agents.has(agent.id) && !this._simulatedIds.has(agent.id)) {
+            return; // Don't overwrite real agents
+        }
+        this._simulatedIds.add(agent.id);
+        this._agents.set(agent.id, agent);
+        this._fire(agent, 'created');
+    }
+
+    /**
+     * Inject a fake batch into the store.
+     */
+    __injectSimulatedBatch(batch: ISubAgentBatch): void {
+        this._simulatedIds.add(batch.id);
+        this._batches.set(batch.id, batch);
+    }
+
+    /**
+     * Update a simulated agent's state. Fires appropriate events.
+     */
+    __updateSimulatedAgent(id: string, updates: Partial<ISubAgent>): void {
+        const agent = this._agents.get(id);
+        if (!agent || !this._simulatedIds.has(id)) return;
+
+        const prev = agent.status;
+        Object.assign(agent, updates);
+
+        if (updates.status && updates.status !== prev) {
+            this._fire(agent, 'status_change', prev);
+        } else if (updates.stepCount !== undefined) {
+            this._fire(agent, 'progress');
+        } else {
+            this._fire(agent, 'progress');
+        }
+    }
+
+    /**
+     * Remove a single simulated agent from the store.
+     */
+    __removeSimulatedAgent(id: string): void {
+        if (!this._simulatedIds.has(id)) return;
+        this._simulatedIds.delete(id);
+        this._agents.delete(id);
+        const batch = Array.from(this._batches.values()).find(b => b.agentIds.includes(id));
+        if (batch) {
+            batch.agentIds = batch.agentIds.filter(aid => aid !== id);
+            if (batch.agentIds.length === 0) {
+                this._simulatedIds.delete(batch.id);
+                this._batches.delete(batch.id);
+            }
+        }
+        // Fire a dummy event to refresh UI
+        this._onEvent.fire({ agent: { id } as any, type: 'status_change' });
+    }
+
+    /**
+     * Remove ALL simulated agents and batches from the store.
+     */
+    __removeAllSimulated(): void {
+        for (const id of this._simulatedIds) {
+            this._agents.delete(id);
+            this._batches.delete(id);
+        }
+        this._simulatedIds.clear();
+        // Fire a dummy event to refresh UI
+        this._onEvent.fire({ agent: { id: 'sim-clear' } as any, type: 'status_change' });
     }
 
     // ─── Disposal ───────────────────────────────────────────────────────

@@ -2,7 +2,7 @@
     "name": "antigravity-subagents",
     "displayName": "Antigravity Sub-Agents",
     "description": "Launch, monitor, and orchestrate parallel sub-agents inside Antigravity v1",
-    "version": "0.4.0",
+    "version": "0.5.0",
     "publisher": "abdofallah",
     "engines": {
         "vscode": "^1.85.0"
@@ -107,11 +107,22 @@
                 "title": "Fix MCP Server (Reinstall & Refresh)",
                 "category": "Sub-Agents",
                 "icon": "$(wrench)"
+            },
+            {
+                "command": "subagents.openSimulator",
+                "title": "Open Simulator (Dev)",
+                "category": "Sub-Agents",
+                "icon": "$(beaker)"
             }
         ],
         "configuration": {
             "title": "Sub-Agents",
             "properties": {
+                "subagents.devMode": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Enable dev/debug simulation tools. Do NOT enable in production."
+                },
                 "subagents.defaultModel": {
                     "type": "string",
                     "default": "flash",
@@ -166,6 +177,11 @@
                     "command": "subagents.refresh",
                     "when": "view == subagents.active || view == subagents.history",
                     "group": "navigation"
+                },
+                {
+                    "command": "subagents.openSimulator",
+                    "when": "view == subagents.active && config.subagents.devMode",
+                    "group": "navigation"
                 }
             ],
             "view/item/context": [
@@ -194,6 +210,7 @@
     "scripts": {
         "build": "tsup && npm run test:cdp",
         "build:only": "tsup",
+        "build:release": "cross-env RELEASE=1 tsup",
         "dev": "tsup --watch",
         "test": "npm run test:cdp",
         "test:cdp": "npx tsx src/tests/cdp-scripts.test.ts",
@@ -208,6 +225,7 @@
     "devDependencies": {
         "@types/node": "^20.0.0",
         "@types/vscode": "^1.85.0",
+        "cross-env": "^10.1.0",
         "tsup": "^8.0.0",
         "typescript": "^5.0.0"
     }

@@ -5,6 +5,57 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] — 2026-05-26
+
+### Added
+
+- **Dev-Only Simulation Panel** — Spawn fake sub-agents and manually control their lifecycle states from a rich WebviewPanel (command: `Sub-Agents: Open Simulator (Dev)`). Exercises all UI surfaces in real-time without launching real cascades.
+  - Spawn with custom label, task, model, parent ID, and optional real cascade Chat ID (for testing sub-agent view screen).
+  - Transition agents between all states: Pending → Running → Waiting for Action → Completed / Failed / Cancelled.
+  - Quick presets: "3 Running", "Mixed (5 agents)", "All States", etc.
+  - Batch spawn mode for testing multi-agent batches.
+  - Simulated pending actions with configurable action type and target.
+  - Auto-cleanup on panel close — agents never persisted; vanish on IDE restart.
+  - Built-in "Restart Extension Host" and "Reload Window" convenience buttons.
+- **`subagents.devMode` Setting** — Boolean gate for simulation tools (default: false). Simulation panel only registers when enabled.
+- **`build:release` Script** — Production build with `__DEV__=false` that dead-code eliminates all simulation code via esbuild.
+- **`cross-env` Dev Dependency** — For cross-platform environment variable support in release builds.
+
+### Redesigned
+
+- **Chatbox Dropdown (CDP)** — Complete visual overhaul matching the native Antigravity design language:
+  - Injected **inside** `#antigravity.agentSidePanelInputBox` as a connected top section (no longer floating above).
+  - Collapsible header with chevron animation and summary text ("N subagents running" / "N subagents blocked").
+  - Batch grouping with per-batch collapse toggle (chevron + "Batch (N agents: …)" label).
+  - Animated spinner SVG for running agents; bell icon for waiting agents.
+  - Inline **Approve** / **Deny** action buttons on waiting agent cards inside the dropdown.
+  - Notification badges on parent chat sidebar items with running/waiting counts.
+- **Sidebar Agent Panel (CDP)** — Redesigned agent rows in the right-side panel:
+  - Per-agent cards with status-specific icons (spinner, checkmark, error, notification dot).
+  - Subtitle row showing step count, elapsed time, or pending action description.
+  - Inline **Approve** / **Deny** buttons for agents in `waiting_for_action` state.
+  - Stop overlay on hover for active agents (gradient fade with stop-circle icon).
+  - "No subagents." empty state message when section is expanded with zero agents.
+  - Auto-reset "See All" expansion when agent count changes (prevents stale expanded state showing all rows).
+- **Lock Watcher (CDP)** — Rewritten to properly handle all 4 sub-agent chat states:
+  - Archived + pending action → Action bar with Run / No / Reject buttons.
+  - Archived + no action → "Restore" button hidden, "🔒 Sub-agent chat — view only" label shown.
+  - Unarchived + pending action → Input box replaced with action bar.
+  - Unarchived + no action → Input box replaced with view-only lock banner.
+  - Proper cleanup when navigating away from a sub-agent chat (restores original children).
+
+### Fixed
+
+- **Batch collapse toggle not working** — Click handler toggled state and rotated chevron but never hid/showed agent rows (DOM only updated on re-render). Fixed by wrapping rows in a container and toggling `display` directly in the click handler.
+- **`display:none` overwritten by `cssText`** — Row hiding was immediately overwritten by the next `cssText` assignment. Fixed by combining into a single `cssText` string with conditional display property.
+- **Stale "See All" after agent count change** — `expanded` state persisted across data updates, showing all agents when new ones arrived. Added `lastAgentCount` tracking to auto-reset.
+
+### Changed
+
+- **Orchestrator persistence** — Now uses a `_simulatedIds` Set to track ephemeral agents instead of prefix-matching. Simulated agents (any ID format) are excluded from `globalState` persistence.
+- **`tsup.config.ts`** — Added `define: { '__DEV__': ... }` for build-time flag substitution.
+- **`package.json`** — Added `openSimulator` command, `devMode` setting, and view menu entry (gated by `config.subagents.devMode`).
+
 ## [0.4.0] — 2026-05-25
 
 ### Refactored
@@ -115,6 +166,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - MutationObserver + setInterval watchers for persistent UI enforcement.
 - Background poll loop with trajectory summary diffing for progress tracking.
 
+[0.5.0]: https://github.com/abdofallah/Antigravity-Sub-Agents/releases/tag/v0.5.0
 [0.4.0]: https://github.com/abdofallah/Antigravity-Sub-Agents/releases/tag/v0.4.0
 [0.3.0]: https://github.com/abdofallah/Antigravity-Sub-Agents/releases/tag/v0.3.0
 [0.2.0]: https://github.com/abdofallah/Antigravity-Sub-Agents/releases/tag/v0.2.0
