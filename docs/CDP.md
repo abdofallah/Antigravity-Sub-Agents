@@ -6,9 +6,11 @@ This document explains how the Antigravity Sub-Agents extension injects real-tim
 
 - [Why CDP?](#why-cdp)
 - [How Antigravity IDE Works](#how-antigravity-ide-works)
+- [Module Structure](#module-structure)
 - [CDP Connection Flow](#cdp-connection-flow)
 - [Target Management](#target-management)
 - [DOM Injection Strategy](#dom-injection-strategy)
+- [Script Builder Architecture](#script-builder-architecture)
 - [Trusted Types CSP Compliance](#trusted-types-csp-compliance)
 - [Router Subscription](#router-subscription)
 - [Persistent UI Enforcement](#persistent-ui-enforcement)
@@ -42,6 +44,27 @@ Antigravity IDE has multiple Electron windows/targets:
 
 The **Manager** target is the one that renders the chat interface. It appears after the Launchpad loads, which is why we implement target hot-switching.
 
+## Module Structure
+
+The CDP system is organized under `src/cdp/`:
+
+```
+src/cdp/
+├── index.ts              Re-exports CdpSidebarInjector
+├── cdp-injector.ts       Connection orchestration, event bindings, injection lifecycle
+├── target-manager.ts     HTTP target discovery, ws module resolution, best-target selection
+└── scripts/
+    ├── css.ts            Generates injection CSS (dot indicators, spinners, keyframes)
+    ├── build-router-sub.ts    TanStack Router subscription for conversation detection
+    ├── build-chatbox-ui.ts    Parent chat dropdown + notification badge
+    ├── build-lock-watcher.ts  Sub-agent chat restrictions + archive banner overrides
+    └── build-panel-script.ts  Main panel injection IIFE composing all fragments
+```
+
+**Design principle:** Each script builder is a pure TypeScript function that returns a raw JavaScript string. The `buildPanelScript()` composer calls `buildChatboxUI()` and `buildLockWatcher()` to assemble the full injection payload. This makes each fragment independently testable.
+
+**Smoke tests** in `src/tests/cdp-scripts.test.ts` validate that all builders produce syntactically valid JavaScript, including edge cases like empty data and special characters.
+
 ## CDP Connection Flow
 
 ```
@@ -49,14 +72,17 @@ The **Manager** target is the one that renders the chat interface. It appears af
    │
 2. Probe CDP port (default: 9347)
    │  GET http://127.0.0.1:9347/json
+   │   └─ (target-manager.ts: getTargets)
    │
 3. Receive target list
    │  [ { id, type, title, webSocketDebuggerUrl }, ... ]
+   │   └─ (target-manager.ts: findBestTarget)
    │
 4. Find best target (prefer "Manager", fallback to "Launchpad")
    │
 5. Connect WebSocket to target's debugger URL
    │  ws://127.0.0.1:9347/devtools/page/{targetId}
+   │   └─ (target-manager.ts: loadWs resolves ws from IDE's node_modules)
    │
 6. Enable Runtime domain
    │  → Runtime.enable
@@ -64,10 +90,11 @@ The **Manager** target is the one that renders the chat interface. It appears af
 7. Register CDP bindings
    │  → Runtime.addBinding("__saRouterChange")    // Route events
    │  → Runtime.addBinding("__saCancelAction")    // Cancel buttons
+   │  → Runtime.addBinding("__saActionHandler")   // Approve/reject actions
    │
 8. Inject CSS + JavaScript
-   │  → Runtime.evaluate(cssScript)
-   │  → Runtime.evaluate(mainScript)
+   │  → Runtime.evaluate(cssScript)               ← scripts/css.ts
+   │  → Runtime.evaluate(panelScript)             ← scripts/build-panel-script.ts
    │
 9. Start refresh loop + heartbeat + target rescan
 ```
@@ -88,7 +115,7 @@ The extension probes this port on activation and retries every 10 seconds.
 
 ### WebSocket Module Resolution
 
-The `ws` npm package is not bundled with the extension. Instead, we resolve it from the IDE's own `node_modules`:
+The `ws` npm package is not bundled with the extension. Instead, `target-manager.ts` resolves it from the IDE's own `node_modules`:
 
 ```
 C:\Users\{user}\AppData\Local\Programs\Antigravity IDE\
@@ -99,7 +126,7 @@ This avoids bundling issues and uses the exact same WebSocket implementation as 
 
 ## Target Management
 
-### Hot-Switching
+### Hot-Switching (`cdp-injector.ts`)
 
 The Launchpad target loads first, and the Manager target appears later. The extension handles this:
 
@@ -136,7 +163,7 @@ Specifically, we find the **scrollable messages container** (identified by `over
 
 ### Two-Phase Injection
 
-**Phase 1: Create Shell**
+**Phase 1: Create Shell** (`build-panel-script.ts`)
 
 On first injection, create the persistent container:
 
@@ -175,6 +202,31 @@ Each sub-agent gets a card element:
 </div>
 ```
 
+## Script Builder Architecture
+
+The injection JavaScript is built by composable TypeScript functions:
+
+```
+buildPanelScript(data)           ← Main entry point (build-panel-script.ts)
+  │
+  ├── Embeds agent data as JSON
+  ├── Creates shell HTML structure
+  ├── Renders agent cards with action buttons
+  │
+  ├── buildChatboxUI()           ← Dropdown + notification badge (build-chatbox-ui.ts)
+  │     └── Shows running count on parent chat input
+  │
+  └── buildLockWatcher()         ← Chat restrictions (build-lock-watcher.ts)
+        ├── Input overlay on sub-agent chats
+        ├── Archive banner override
+        └── MutationObserver + setInterval enforcement
+```
+
+Each builder returns a string of raw JavaScript. The main builder wraps everything in an IIFE that:
+1. Checks if an update is needed (data hash comparison)
+2. Creates or updates the shell DOM
+3. Sets up watchers for UI persistence
+
 ## Trusted Types CSP Compliance
 
 Antigravity IDE enforces **Trusted Types** Content Security Policy, which blocks `innerHTML`, `outerHTML`, and similar APIs. All DOM manipulation uses safe APIs:
@@ -194,7 +246,7 @@ CSS injection uses a `<style>` element created via `document.createElement('styl
 
 ## Router Subscription
 
-To detect which conversation the user is viewing, we subscribe to the **TanStack Router** that powers the Manager UI:
+To detect which conversation the user is viewing, `build-router-sub.ts` subscribes to the **TanStack Router** that powers the Manager UI:
 
 ```javascript
 // Subscribe to route changes
@@ -214,11 +266,11 @@ if (router && router.subscribe) {
 }
 ```
 
-The `__saRouterChange` CDP binding forwards route events to the extension's TypeScript code, which triggers panel refreshes.
+The `__saRouterChange` CDP binding forwards route events to the extension's TypeScript code (`cdp-injector.ts: _onRouterChange`), which triggers panel refreshes.
 
 ## Persistent UI Enforcement
 
-React's Virtual DOM constantly re-renders the Manager UI, which can destroy our injected elements. We use a multi-layer persistence strategy:
+React's Virtual DOM constantly re-renders the Manager UI, which can destroy our injected elements. The `build-lock-watcher.ts` module implements a multi-layer persistence strategy:
 
 ### Layer 1: MutationObserver
 
@@ -239,13 +291,13 @@ Catches cases where MutationObserver misses a change.
 
 ### Layer 3: Event-Driven Refresh
 
-The Orchestrator fires events on state changes, which trigger `injectSubAgentPanel()` in the CDP injector. This provides instant updates when agents complete.
+The Orchestrator fires events on state changes, which trigger `injectSubAgentPanel()` in `cdp-injector.ts`. This provides instant updates when agents complete.
 
 ## Chat Locking
 
 ### Sub-Agent Chats (View Only)
 
-When viewing a sub-agent's chat:
+When viewing a sub-agent's chat (`build-lock-watcher.ts`):
 
 1. **Input overlay** — absolute-positioned div over the chat input box with lock icon.
 2. **Revert button removal** — `[data-testid="revert-button"]` elements set to `display:none`.
@@ -253,7 +305,7 @@ When viewing a sub-agent's chat:
 
 ### Parent Chats (During Execution)
 
-When viewing the parent's chat while sub-agents run:
+When viewing the parent's chat while sub-agents run (`build-chatbox-ui.ts`):
 
 1. **Input overlay** — shows spinner, running count, and "Stop All & Don't Report" button.
 2. The stop button triggers `__saCancelAction` with `type: 'silent'`.
@@ -329,6 +381,7 @@ Expected response:
 ### "SCRIPT ERROR: SyntaxError"
 
 - Usually a brace mismatch in the injected JavaScript.
+- Run `npm run test:cdp` to validate all script builders produce valid JS.
 - Check the "Sub-Agents CDP" output channel for details.
 - Run `Sub-Agents: Open Manager DevTools` to debug in the browser console.
 
@@ -341,7 +394,7 @@ Expected response:
 ### UI Flickering
 
 - React re-renders are fighting with our DOM changes.
-- The MutationObserver should handle this, but extreme cases may need the `setInterval` fallback frequency adjusted.
+- The MutationObserver in `build-lock-watcher.ts` should handle this, but extreme cases may need the `setInterval` fallback frequency adjusted.
 
 ### Connection Drops
 

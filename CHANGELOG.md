@@ -5,6 +5,57 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] — 2026-05-25
+
+### Refactored
+
+- **Full Separation of Concerns** — Dismantled 3 monolithic files (3,543 lines total) into 26 focused modules across 5 concern-aligned directories:
+  - `src/config/` — Settings reads, MCP config management, instructions file writer.
+  - `src/commands/` — VS Code command registration and UI flows (launch wizard, quick launch, health check).
+  - `src/cdp/` — CDP connection orchestration, target discovery, and 5 modular script builders under `scripts/`.
+  - `src/mcp/` — HTTP bridge lifecycle, endpoint handlers, MCP stdio server script generator.
+  - `src/orchestrator/` — Slim coordinator class delegating to launcher, monitor, messaging, and actions sub-modules.
+- **Extension entry point slimmed** — `extension.ts` reduced from 945 to ~200 lines (pure wire-up).
+- **Orchestrator modularized** — Core class reduced from 1,256 to ~340 lines via context interface pattern that avoids circular imports.
+- **CDP scripts extracted** — 800+ lines of inline JavaScript strings moved to composable builder functions (`css.ts`, `build-router-sub.ts`, `build-chatbox-ui.ts`, `build-lock-watcher.ts`, `build-panel-script.ts`).
+- **MCP bridge split** — Monolithic `mcp-bridge.ts` separated into `bridge.ts` (server lifecycle), `handlers.ts` (endpoint logic), and `server-script.ts` (script generation).
+
+### Added
+
+- **CDP Script Smoke Tests** — 24 tests validating all script builders produce syntactically valid JavaScript, including edge cases (empty data, special characters). Run automatically on every `npm run build`.
+- **Test pipeline in build** — `npm run build` now runs `tsup && npm run test:cdp`. Separate `build:only`, `test`, and `test:cdp` scripts added.
+- **`send_message` MCP tool** — Added to MCP tools table in README.
+
+### Fixed
+
+- **Latent type error in `rejectAction`** — The original monolithic orchestrator fired `'cancelled'` as an event type, which doesn't exist in the `ISubAgentEvent['type']` union (`'created' | 'progress' | 'status_change' | 'completed' | 'action_required'`). `tsup` (esbuild) silently ignored it; strict `tsc --noEmit` caught it during audit. Fixed to `'status_change'`.
+
+### Changed
+
+- **Documentation fully updated** — `ARCHITECTURE.md`, `CDP.md`, `CONTRIBUTING.md`, `README.md`, and `CHANGELOG.md` rewritten to reflect the new modular layout, context interface pattern, test pipeline, and build scripts.
+
+## [0.3.0] — 2026-05-25
+
+### Added
+
+- **Remote Action Approval** — Approve, deny, or respond to sub-agent permission requests directly from the parent chat without unarchiving child conversations.
+- **Dropdown Action Cards** — Waiting sub-agents in the above-chatbox dropdown render as AG 2.0-style cards with 🔔 bell icon, agent label, command/target description, and **Approve** / **Deny** buttons.
+- **Archive Banner Action Buttons** — When viewing a sub-agent chat with a pending action, the archived banner is replaced with **Run** / **No** / **Reject** controls:
+  - **Run** — Approves the proposed command (`HandleCascadeUserInteraction` with `allow: true`).
+  - **No** — Denies the permission and prompts for a custom text message sent back to the agent so it can adapt.
+  - **Reject** — Denies the permission AND cancels the cascade entirely (`CancelCascadeInvocation`).
+- **`IPendingAction` Interface** — New type in `types.ts` tracking `trajectoryId`, `stepIndex`, `actionType`, and `target` for each waiting step.
+- **Orchestrator Action Methods** — `approveAction()`, `respondAction()`, `rejectAction()` public methods making the corresponding LS RPC calls.
+- **`_extractPendingAction()` Helper** — Parses trajectory summary `waitingSteps` to populate `pendingAction` on each agent during the poll loop.
+- **`__saActionHandler` CDP Binding** — New runtime binding for page-to-extension communication of approve/respond/reject actions.
+- **MCP Bridge Action Routes** — `POST /approve-action`, `/respond-action`, `/reject-action` HTTP endpoints for programmatic control.
+
+### Fixed
+
+- **`actionBtn is not defined` crash** — The `actionHandler()` and `actionBtn()` helper functions were missing from the injected JS, causing the entire dropdown to crash and sub-agents to disappear from the UI when any agent entered `waiting_for_action` state.
+- **`getConversation: 404` loop** — `_extractPendingAction()` was calling `getConversation()` which returns 404 for cascade IDs. Rewrote to extract all data from the trajectory summary directly, eliminating the failing RPC call.
+- **Corrupted stale-threshold code** — Restored the `STALE_THRESHOLD` completion logic and `_persistState()` call at the end of `_pollProgress` that were accidentally removed during editing.
+
 ## [0.2.0] — 2026-05-24
 
 ### Added
@@ -64,5 +115,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - MutationObserver + setInterval watchers for persistent UI enforcement.
 - Background poll loop with trajectory summary diffing for progress tracking.
 
+[0.4.0]: https://github.com/abdofallah/Antigravity-Sub-Agents/releases/tag/v0.4.0
+[0.3.0]: https://github.com/abdofallah/Antigravity-Sub-Agents/releases/tag/v0.3.0
 [0.2.0]: https://github.com/abdofallah/Antigravity-Sub-Agents/releases/tag/v0.2.0
 [0.1.0]: https://github.com/abdofallah/Antigravity-Sub-Agents/releases/tag/v0.1.0

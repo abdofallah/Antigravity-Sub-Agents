@@ -23,11 +23,14 @@ cd Antigravity-Sub-Agents
 npm install
 ```
 
-### 3. Build
+### 3. Build & Test
 
 ```bash
-npm run build        # One-time build
+npm run build        # Build + run tests (24 CDP smoke tests)
+npm run build:only   # Build only (skip tests)
 npm run dev          # Watch mode (rebuilds on changes)
+npm run test         # Run all tests
+npm run test:cdp     # Run CDP script smoke tests only
 ```
 
 ### 4. Test in Antigravity IDE
@@ -41,36 +44,112 @@ npm run dev          # Watch mode (rebuilds on changes)
 ```
 antigravity-subagents/
 ├── src/
-│   ├── extension.ts          # Entry point — wires all modules
-│   ├── orchestrator.ts       # Core brain — lifecycle, polling, state
-│   ├── mcp-bridge.ts         # MCP server exposing tools to agents
-│   ├── cdp-injector.ts       # CDP-based sidebar UI injection
-│   ├── tree-provider.ts      # VS Code TreeView providers
-│   ├── status-bar.ts         # Status bar widget
-│   ├── notifications.ts      # Toast notification manager
-│   └── types.ts              # Shared types, enums, constants
+│   ├── extension.ts              # Entry point — wires all modules (~200 LOC)
+│   ├── types.ts                  # Shared types, enums, constants
+│   ├── tree-provider.ts          # VS Code TreeView providers
+│   ├── status-bar.ts             # Status bar widget
+│   ├── notifications.ts          # Toast notification manager
+│   │
+│   ├── config/                   # Configuration & setup
+│   │   ├── settings.ts           # Settings reads, model maps
+│   │   ├── mcp-config.ts         # MCP config find/write/auto-fix/health
+│   │   └── instructions.ts       # Prompt injection file writer
+│   │
+│   ├── commands/                 # VS Code command handlers
+│   │   ├── index.ts              # Command registration hub
+│   │   ├── launch-flow.ts        # Multi-agent QuickPick wizard
+│   │   ├── quick-launch.ts       # Single-agent quick launch
+│   │   └── health-check.ts       # CDP setup guide, diagnostics
+│   │
+│   ├── cdp/                      # Chrome DevTools Protocol injection
+│   │   ├── index.ts              # Re-exports CdpSidebarInjector
+│   │   ├── cdp-injector.ts       # Connection + injection orchestration
+│   │   ├── target-manager.ts     # Target discovery, ws module resolution
+│   │   └── scripts/              # Modular injection script builders
+│   │       ├── css.ts            # Injection CSS
+│   │       ├── build-router-sub.ts    # Router subscription
+│   │       ├── build-chatbox-ui.ts    # Parent chat dropdown
+│   │       ├── build-lock-watcher.ts  # Chat locking enforcement
+│   │       └── build-panel-script.ts  # Main panel IIFE
+│   │
+│   ├── mcp/                      # MCP Bridge server
+│   │   ├── index.ts              # Re-exports McpBridge
+│   │   ├── bridge.ts             # HTTP server lifecycle + routing
+│   │   ├── handlers.ts           # Endpoint handlers
+│   │   └── server-script.ts      # MCP stdio server generator
+│   │
+│   ├── orchestrator/             # Core brain
+│   │   ├── index.ts              # Re-exports Orchestrator class
+│   │   ├── orchestrator.ts       # Slim coordinator (~340 LOC)
+│   │   ├── launcher.ts           # Cascade creation + workspace discovery
+│   │   ├── monitor.ts            # Polling loop + stale detection
+│   │   ├── messaging.ts          # Message buffering + batch delivery
+│   │   └── actions.ts            # Cancel, approve, respond, reject
+│   │
+│   └── tests/                    # Smoke tests
+│       └── cdp-scripts.test.ts   # 24 CDP script validation tests
+│
 ├── resources/
-│   └── subagents.svg         # Activity bar icon
+│   └── subagents.svg             # Activity bar icon
 ├── docs/
-│   ├── ARCHITECTURE.md       # System architecture overview
-│   └── CDP.md                # CDP injection deep-dive
+│   ├── ARCHITECTURE.md           # System architecture overview
+│   └── CDP.md                    # CDP injection deep-dive
 ├── .github/
 │   └── workflows/
-│       └── release.yml       # CI/CD pipeline
-├── package.json              # Extension manifest
-├── tsconfig.json             # TypeScript config
-├── tsup.config.ts            # Build config
-├── CHANGELOG.md              # Release notes
-└── README.md                 # Project readme
+│       └── release.yml           # CI/CD pipeline
+├── package.json                  # Extension manifest + scripts
+├── tsconfig.json                 # TypeScript config (strict mode)
+├── tsup.config.ts                # Build config (CommonJS, es2020)
+├── CHANGELOG.md                  # Release notes
+└── README.md                     # Project readme
 ```
 
 ## Code Style
 
-- **TypeScript strict mode** — all code must pass `strict: true`.
+- **TypeScript strict mode** — all code must pass `tsc --noEmit` with zero errors.
 - **No `innerHTML`** — use DOM API (`createElement`, `appendChild`) for Trusted Types CSP compliance.
 - **Event-driven** — use the Orchestrator's `onEvent()` emitter, not polling, for UI updates.
 - **Documentation** — all public methods must have JSDoc comments.
 - **Module headers** — each file starts with a `@module` JSDoc block explaining its role.
+- **Context interfaces** — sub-modules receive state via typed context objects, never import the parent class.
+- **Tests must pass** — `npm run build` runs tests automatically; PRs with failing tests won't be accepted.
+
+## Architecture Principles
+
+### Separation of Concerns
+
+Each directory owns one domain:
+
+| Directory | Domain |
+|-----------|--------|
+| `config/` | Reading settings, writing MCP config, LS health |
+| `commands/` | VS Code command palette interactions |
+| `cdp/` | Chrome DevTools Protocol injection |
+| `mcp/` | HTTP bridge for parent-agent communication |
+| `orchestrator/` | Agent lifecycle, state, polling, messaging |
+
+### Context Interface Pattern
+
+Sub-modules under `orchestrator/` do NOT import the `Orchestrator` class directly. Instead, the main class passes a typed context object:
+
+```typescript
+// In launcher.ts
+export interface LaunchContext {
+    sdk: AntigravitySDK;
+    agents: Map<string, ISubAgent>;
+    fire: (agent: ISubAgent, type: ISubAgentEvent['type']) => void;
+    persistState: () => void;
+    // ...
+}
+
+export async function launchBatch(ctx: LaunchContext, config: ILaunchConfig) { ... }
+```
+
+This avoids circular imports and makes modules independently testable.
+
+### Script Builder Pattern
+
+CDP injection scripts are built by composable TypeScript functions that return raw JavaScript strings. The main `buildPanelScript()` composes fragments from other builders. Tests validate that the output is syntactically valid JavaScript.
 
 ## Making Changes
 
@@ -88,8 +167,10 @@ Follow [Conventional Commits](https://www.conventionalcommits.org/):
 ```
 feat: add per-agent model selection
 fix: resolve brace mismatch in CDP injector script
+refactor: extract orchestrator monitor to separate module
 docs: update architecture diagram
 chore: bump SDK version
+test: add smoke tests for lock watcher script
 ```
 
 ### Pull Requests
@@ -97,9 +178,10 @@ chore: bump SDK version
 1. Fork the repository.
 2. Create a feature branch from `dev`.
 3. Make your changes with clear commit messages.
-4. Ensure `npm run build` passes cleanly (no errors or warnings).
-5. Submit a PR targeting the `dev` branch.
-6. Describe what changed and why in the PR description.
+4. Ensure `npm run build` passes cleanly (build + tests, no errors).
+5. Ensure `npx tsc --noEmit` has zero type errors.
+6. Submit a PR targeting the `dev` branch.
+7. Describe what changed and why in the PR description.
 
 ## Architecture Notes
 
@@ -117,6 +199,9 @@ Before making changes, read:
 | Two cancel modes | User cancels report results; parent stops are silent |
 | Archive on create | Hides sub-agent chats from sidebar clutter |
 | Event-driven + fallback poll | Instant UI updates with 3s safety net |
+| Context interfaces | Avoids circular imports between orchestrator and helpers |
+| Modular script builders | Each CDP script is testable and composable independently |
+| Tests in build pipeline | Catches script syntax errors before packaging |
 
 ## Reporting Issues
 

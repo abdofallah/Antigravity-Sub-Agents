@@ -2,7 +2,7 @@
     "name": "antigravity-subagents",
     "displayName": "Antigravity Sub-Agents",
     "description": "Launch, monitor, and orchestrate parallel sub-agents inside Antigravity v1",
-    "version": "0.3.0",
+    "version": "0.4.0",
     "publisher": "abdofallah",
     "engines": {
         "vscode": "^1.85.0"
@@ -192,8 +192,11 @@
     },
     "license": "MIT",
     "scripts": {
-        "build": "tsup",
+        "build": "tsup && npm run test:cdp",
+        "build:only": "tsup",
         "dev": "tsup --watch",
+        "test": "npm run test:cdp",
+        "test:cdp": "npx tsx src/tests/cdp-scripts.test.ts",
         "package": "vsce package --no-dependencies",
         "version:patch": "npm version patch --no-git-tag-version",
         "version:minor": "npm version minor --no-git-tag-version",

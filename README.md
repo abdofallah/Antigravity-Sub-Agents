@@ -129,6 +129,7 @@ When an AI agent has access to the `subagents` MCP server, these tools are avail
 | `cancel_subagent` | Cancel a specific agent by ID |
 | `get_subagent` | Get details of a specific agent |
 | `get_batch` | Get all agents in a batch |
+| `send_message` | Send results from sub-agent to parent |
 
 ## Development
 
@@ -136,7 +137,9 @@ When an AI agent has access to the `subagents` MCP server, these tools are avail
 git clone https://github.com/abdofallah/Antigravity-Sub-Agents.git
 cd Antigravity-Sub-Agents
 npm install
-npm run build    # or: npm run dev (watch mode)
+npm run build    # Build + tests (24 CDP smoke tests)
+npm run dev      # Watch mode (rebuilds on changes)
+npm run test     # Run tests only
 ```
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the full development guide.
