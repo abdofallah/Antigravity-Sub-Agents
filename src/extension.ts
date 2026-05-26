@@ -36,7 +36,7 @@ import { StatusBarWidget } from './status-bar';
 import { NotificationManager } from './notifications';
 import { McpBridge } from './mcp';
 import { CdpSidebarInjector } from './cdp';
-import { getConfig, getCdpPort } from './config/settings';
+import { getConfig, getCdpPort, getStatusPollInterval } from './config/settings';
 import { autoInstallMcpConfig, autoFixMcpServer, queryMcpServerHealth } from './config/mcp-config';
 import { writeInstructionsFile } from './config/instructions';
 import { registerAllCommands } from './commands';
@@ -228,7 +228,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
                 await autoFixMcpServer(context, mcpPort, statusTree, sdk, log);
             }
         }
-    }, 3000);
+    }, getStatusPollInterval());
     context.subscriptions.push({ dispose: () => clearInterval(statusPollTimer) });
 
     // ─── Commands ───────────────────────────────────────────────────

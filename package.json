@@ -2,7 +2,7 @@
     "name": "antigravity-subagents",
     "displayName": "Antigravity Sub-Agents",
     "description": "Launch, monitor, and orchestrate parallel sub-agents inside Antigravity v1",
-    "version": "0.5.0",
+    "version": "0.6.0",
     "publisher": "abdofallah",
     "engines": {
         "vscode": "^1.85.0"
@@ -158,6 +158,46 @@
                     "type": "boolean",
                     "default": true,
                     "description": "Automatically install the MCP server configuration on activation."
+                },
+                "subagents.uiPollInterval": {
+                    "type": "number",
+                    "default": 300,
+                    "minimum": 100,
+                    "maximum": 2000,
+                    "description": "Browser-side DOM enforcement interval (badges, locks, breadcrumbs) in milliseconds."
+                },
+                "subagents.progressPollInterval": {
+                    "type": "number",
+                    "default": 300,
+                    "minimum": 100,
+                    "maximum": 15000,
+                    "description": "How often to poll active sub-agent progress from the language server (ms)."
+                },
+                "subagents.statusPollInterval": {
+                    "type": "number",
+                    "default": 300,
+                    "minimum": 100,
+                    "maximum": 15000,
+                    "description": "How often to check MCP server health status (ms)."
+                },
+                "subagents.heartbeatInterval": {
+                    "type": "number",
+                    "default": 300,
+                    "minimum": 100,
+                    "maximum": 60000,
+                    "description": "CDP connection heartbeat interval (ms)."
+                },
+                "subagents.targetRescanInterval": {
+                    "type": "number",
+                    "default": 300,
+                    "minimum": 100,
+                    "maximum": 30000,
+                    "description": "How often to scan for new CDP Manager targets (ms)."
+                },
+                "subagents.debugLogging": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Enable detailed trace logging in the Sub-Agents output channel and browser DevTools console. Useful for debugging injection and synchronization issues."
                 }
             }
         },

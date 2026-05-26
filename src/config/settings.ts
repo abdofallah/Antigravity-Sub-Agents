@@ -35,3 +35,37 @@ export function getDefaultModel(): number {
 export function getCdpPort(): number {
     return getConfig().get<number>('cdpPort', 9347);
 }
+
+// ─── Configurable Polling Intervals ────────────────────────────────────
+
+/** Browser-side DOM enforcement interval (badges, locks, breadcrumbs) in ms */
+export function getUiPollInterval(): number {
+    return getConfig().get<number>('uiPollInterval', 300);
+}
+
+/** Orchestrator progress poll interval in ms */
+export function getProgressPollInterval(): number {
+    return getConfig().get<number>('progressPollInterval', 300);
+}
+
+/** Extension status panel poll interval in ms */
+export function getStatusPollInterval(): number {
+    return getConfig().get<number>('statusPollInterval', 300);
+}
+
+/** CDP heartbeat interval in ms */
+export function getHeartbeatInterval(): number {
+    return getConfig().get<number>('heartbeatInterval', 300);
+}
+
+/** CDP target rescan interval in ms */
+export function getTargetRescanInterval(): number {
+    return getConfig().get<number>('targetRescanInterval', 300);
+}
+
+// ─── Debug / Logging ───────────────────────────────────────────────────
+
+/** Whether detailed trace logging is enabled */
+export function getDebugLogging(): boolean {
+    return getConfig().get<boolean>('debugLogging', false);
+}

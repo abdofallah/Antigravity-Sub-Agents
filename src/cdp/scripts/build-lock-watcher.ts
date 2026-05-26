@@ -18,20 +18,25 @@
  * Build the lock watcher installation script fragment.
  * Must be embedded inside the main injection IIFE.
  */
-export function buildLockWatcher(): string {
+export function buildLockWatcher(pollInterval: number = 300): string {
     return `
                 // --- Sub-agent chat cosmetic tweaks (persistent watcher) ---
                 // Install a persistent watcher that continuously enforces restrictions.
                 // This solves the race where React hasn't rendered the DOM yet.
                 if (!window.__saLockWatcher) {
-                    window.__saLockWatcher = { subAgentIds: [], pendingActions: {} };
+                    window.__saLockWatcher = { subAgentIds: [], pendingActions: {}, parentMap: {}, parentTitles: {} };
                 }
                 // Update the watcher's data on every injection cycle
                 window.__saLockWatcher.subAgentIds = subAgentIds;
                 window.__saLockWatcher.pendingActions = pendingActions;
+                window.__saLockWatcher.parentMap = parentMap;
+                window.__saLockWatcher.parentTitles = parentTitles;
 
+                sections.watcher = window.__saLockWatcherInstalled ? 'updated' : 'installed';
                 if (!window.__saLockWatcherInstalled) {
                     window.__saLockWatcherInstalled = true;
+                    var _lastWatcherConvo = null;
+                    var _lastWatcherLog = '';
 
                     function enforceLocks() {
                         var w = window.__saLockWatcher;
@@ -50,9 +55,16 @@ export function buildLockWatcher(): string {
                                 }
                             }
                         } catch(e) {}
-                        if (!convoId) return;
 
+                        // Lock/breadcrumb logic only runs if we have an active convo
+                        if (convoId) {
                         var isSub = w.subAgentIds.indexOf(convoId) !== -1;
+
+                        // Log convo transitions
+                        if (convoId !== _lastWatcherConvo) {
+                            if (_saDebug) console.log('[SA:watcher] convo=' + convoId.substring(0,8) + ', isSub=' + isSub + ', subAgentIds=[' + w.subAgentIds.map(function(s){return s.substring(0,8);}).join(',') + ']');
+                            _lastWatcherConvo = convoId;
+                        }
 
                         if (isSub) {
                             // Hide revert/undo buttons on sub-agent chats
@@ -64,6 +76,15 @@ export function buildLockWatcher(): string {
                             // Find the archive banner container
                             var bannerContainer = document.querySelector('.relative.flex.items-center.justify-center.gap-2.p-1');
                             var inputArea = document.getElementById('antigravity.agentSidePanelInputBox');
+
+                            // State guard: compute lock state key and skip if unchanged
+                            var lockState = (bannerContainer ? 'archived' : 'unarchived') + ':' + (action ? action.actionType + ':' + action.target : 'none');
+                            var lockTarget = inputArea || bannerContainer;
+                            if (lockTarget && lockTarget.getAttribute('data-sa-lock-state') === lockState) {
+                                // State unchanged — skip lock UI mutations
+                            } else {
+                            if (_saDebug) console.log('[SA:watcher] lock state changed: ' + lockState + ' (banner=' + (bannerContainer ? 'yes' : 'no') + ', inputArea=' + (inputArea ? 'yes' : 'no') + ', action=' + (action ? action.actionType : 'none') + ')');
+                            if (lockTarget) lockTarget.setAttribute('data-sa-lock-state', lockState);
 
                             if (bannerContainer && action && !document.getElementById(P + '-action-bar')) {
                                 // ── Archived + pending action: replace the banner with action UI ──
@@ -233,6 +254,54 @@ export function buildLockWatcher(): string {
                                     inputArea.appendChild(lockBanner);
                                 }
                             }
+                            } // end lock state guard else
+
+                            // ── Breadcrumb rewriting: show parent chat title instead of workspace ──
+                            var parentId = w.parentMap && w.parentMap[convoId];
+                            if (parentId) {
+                                var bcLabel = String.fromCharCode(0x2190) + ' Parent Chat';
+
+                                // Find the breadcrumb workspace segment
+                                var breadcrumbBar = document.querySelector('.flex.items-center.whitespace-nowrap.overflow-hidden.min-w-0');
+                                if (breadcrumbBar) {
+                                    var wsSegment = breadcrumbBar.querySelector('.flex.items-center.shrink-0');
+                                    if (wsSegment && !wsSegment.getAttribute('data-sa-breadcrumb')) {
+                                        if (_saDebug) console.log('[SA:watcher] breadcrumb: rewriting for parent=' + parentId.substring(0,8));
+                                        // Target the INNER span.truncate (nested inside span.text-sm)
+                                        var innerSpan = wsSegment.querySelector('span.text-sm span.truncate');
+                                        if (innerSpan) {
+                                            wsSegment.setAttribute('data-sa-breadcrumb', 'true');
+                                            // Store only the inner span text (workspace name, no slash)
+                                            wsSegment.setAttribute('data-sa-original-text', innerSpan.textContent || '');
+
+                                            innerSpan.textContent = bcLabel;
+
+                                            // Style the outer clickable span
+                                            var outerSpan = wsSegment.querySelector('span.text-sm');
+                                            if (outerSpan) {
+                                                outerSpan.style.opacity = '1';
+                                                outerSpan.style.cursor = 'pointer';
+                                                outerSpan.addEventListener('click', function(e) {
+                                                    e.preventDefault();
+                                                    e.stopPropagation();
+                                                    try {
+                                                        var r = window.__TSR_ROUTER__;
+                                                        if (r && r.navigate) {
+                                                            r.navigate({ to: '/c/' + parentId });
+                                                        }
+                                                    } catch(ex) {}
+                                                });
+                                            }
+                                        }
+                                    } else if (wsSegment && wsSegment.getAttribute('data-sa-breadcrumb')) {
+                                        // Already modified — re-enforce text if React re-rendered
+                                        var innerSpan2 = wsSegment.querySelector('span.text-sm span.truncate');
+                                        if (innerSpan2 && innerSpan2.textContent !== bcLabel) {
+                                            innerSpan2.textContent = bcLabel;
+                                        }
+                                    }
+                                }
+                            }
                         } else {
                             // ── Not a sub-agent: clean up any lock UI we may have injected ──
                             var lockViewOnly = document.getElementById(P + '-lock-view-only');
@@ -257,12 +326,75 @@ export function buildLockWatcher(): string {
                                     }
                                 }
                             }
+                            // Restore breadcrumb if we modified it
+                            var modifiedBreadcrumb = document.querySelector('[data-sa-breadcrumb]');
+                            if (modifiedBreadcrumb) {
+                                var origText = modifiedBreadcrumb.getAttribute('data-sa-original-text') || '';
+                                modifiedBreadcrumb.removeAttribute('data-sa-breadcrumb');
+                                modifiedBreadcrumb.removeAttribute('data-sa-original-text');
+                                // Restore the inner span text
+                                var restoreSpan = modifiedBreadcrumb.querySelector('span.text-sm span.truncate');
+                                if (restoreSpan && origText) {
+                                    restoreSpan.textContent = origText;
+                                }
+                                // Reset outer span styles
+                                var outerRestore = modifiedBreadcrumb.querySelector('span.text-sm');
+                                if (outerRestore) {
+                                    outerRestore.style.opacity = '';
+                                    outerRestore.style.cursor = '';
+                                }
+                            }
+                        }
+                        } // end if (convoId)
+
+                        // ── Sidebar notification badges: badge ALL parent chats with pending actions ──
+                        // Uses data-sa-badge-state attribute as a hash guard to avoid flicker.
+                        if (w.pendingActions && w.parentMap) {
+                            var badgeTargets = {};
+                            var actionIds = Object.keys(w.pendingActions);
+                            for (var bi = 0; bi < actionIds.length; bi++) {
+                                var parentOfAgent = w.parentMap[actionIds[bi]];
+                                if (parentOfAgent) badgeTargets[parentOfAgent] = true;
+                            }
+                            var targetIds = Object.keys(badgeTargets).sort();
+                            var badgeKey = targetIds.join(',');
+
+                            // Check if badge state changed
+                            var badgeRoot = document.body;
+                            if (badgeRoot.getAttribute('data-sa-badge-state') !== badgeKey) {
+                                if (_saDebug) console.log('[SA:watcher] badge state changed: [' + badgeKey.substring(0,40) + '] (' + targetIds.length + ' targets)');
+                                badgeRoot.setAttribute('data-sa-badge-state', badgeKey);
+
+                                // Remove old badges
+                                var oldBadges = document.querySelectorAll('.' + P + '-chat-notify');
+                                oldBadges.forEach(function(b) { b.remove(); });
+
+                                // Insert new badges
+                                for (var bj = 0; bj < targetIds.length; bj++) {
+                                    var bPill = document.querySelector('span[data-testid="convo-pill-' + targetIds[bj] + '"]');
+                                    if (bPill) {
+                                        var nBadge = document.createElement('span');
+                                        nBadge.className = P + '-chat-notify google-symbols';
+                                        nBadge.textContent = 'notifications';
+                                        nBadge.style.cssText = 'display:inline-flex;align-items:center;justify-content:center;font-size:14px;color:#fbbf24;margin-right:4px;animation:' + P + '-pulse 1.5s ease-in-out infinite;flex-shrink:0;';
+                                        bPill.parentNode.insertBefore(nBadge, bPill);
+                                    }
+                                }
+                            }
+                        } else {
+                            // No pending actions — clear badges if any exist
+                            if (document.body.getAttribute('data-sa-badge-state') !== '') {
+                                if (_saDebug) console.log('[SA:watcher] badge state cleared (no pending actions)');
+                                document.body.setAttribute('data-sa-badge-state', '');
+                                var oldBadges2 = document.querySelectorAll('.' + P + '-chat-notify');
+                                oldBadges2.forEach(function(b) { b.remove(); });
+                            }
                         }
                     }
 
                     // Run immediately + on interval
                     enforceLocks();
-                    setInterval(enforceLocks, 500);
+                    setInterval(enforceLocks, ${pollInterval});
                 }
 `;
 }

@@ -38,6 +38,7 @@ import { LaunchContext, launchBatch } from './launcher';
 import { MonitorContext, MonitorState, createMonitorState, pollProgress } from './monitor';
 import { MessagingContext, sendMessage as msgSendMessage, checkBatchDelivery as msgCheckBatchDelivery, storeTrajectoryResult as msgStoreTrajectoryResult } from './messaging';
 import { ActionContext, cancel as actCancel, cancelAll as actCancelAll, cancelBatch as actCancelBatch, cancelByParent as actCancelByParent, viewChat as actViewChat, approveAction as actApproveAction, respondAction as actRespondAction, rejectAction as actRejectAction, clearHistory as actClearHistory } from './actions';
+import { getProgressPollInterval } from '../config/settings';
 
 // ─── Orchestrator ───────────────────────────────────────────────────────
 
@@ -212,7 +213,7 @@ export class Orchestrator implements vscode.Disposable {
         if (this._pollTimer) return;
         if (this.activeCount === 0) return;
 
-        this._pollTimer = setInterval(() => this._pollProgress(), 3000);
+        this._pollTimer = setInterval(() => this._pollProgress(), getProgressPollInterval());
         this._disposables.push({ dispose: () => this._stopMonitoring() });
     }
 
@@ -410,6 +411,22 @@ export class Orchestrator implements vscode.Disposable {
         this._simulatedIds.clear();
         // Fire a dummy event to refresh UI
         this._onEvent.fire({ agent: { id: 'sim-clear' } as any, type: 'status_change' });
+    }
+
+    // ─── Conversation Queries ───────────────────────────────────────────
+
+    /**
+     * Get the title/summary of a conversation by cascade ID.
+     * Used by CDP injector to show parent chat names in breadcrumbs.
+     */
+    async getConversationTitle(cascadeId: string): Promise<string | null> {
+        try {
+            const conv = await this._sdk.ls.getConversation(cascadeId);
+            // getConversation returns raw RPC data — look for summary/title fields
+            return conv?.summary || conv?.title || conv?.description || null;
+        } catch {
+            return null;
+        }
     }
 
     // ─── Disposal ───────────────────────────────────────────────────────

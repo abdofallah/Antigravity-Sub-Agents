@@ -85,7 +85,8 @@ console.log('\n📋 buildChatboxUI');
 const chatboxScript = buildChatboxUI();
 assert(typeof chatboxScript === 'string' && chatboxScript.length > 0, 'Returns non-empty string');
 assert(chatboxScript.includes('running-dropdown'), 'Contains dropdown ID');
-assert(chatboxScript.includes('chat-notify'), 'Contains notification class');
+assert(chatboxScript.includes('lock watcher'), 'References lock watcher for badges');
+assert(chatboxScript.includes('data-sa-drop-hash'), 'Contains dropdown state guard attribute');
 
 // --- buildLockWatcher ---
 console.log('\n📋 buildLockWatcher');
@@ -93,6 +94,14 @@ const lockScript = buildLockWatcher();
 assert(typeof lockScript === 'string' && lockScript.length > 0, 'Returns non-empty string');
 assert(lockScript.includes('__saLockWatcher'), 'References lock watcher global');
 assert(lockScript.includes('enforceLocks'), 'Contains enforcement function');
+assert(lockScript.includes('chat-notify'), 'Contains notification badge class');
+assert(lockScript.includes('setInterval(enforceLocks, 300)'), 'Default interval is 300ms');
+// Test custom interval
+const lockScript500 = buildLockWatcher(500);
+assert(lockScript500.includes('setInterval(enforceLocks, 500)'), 'Custom interval: 500ms');
+// State guard attributes
+assert(lockScript.includes('data-sa-badge-state'), 'Contains badge state guard attribute');
+assert(lockScript.includes('data-sa-lock-state'), 'Contains lock state guard attribute');
 
 // --- buildPanelScript ---
 console.log('\n📋 buildPanelScript');
@@ -163,6 +172,14 @@ const injectionData: PanelInjectionData = {
     pendingActions: {
         'test-agent-3': { actionType: 'command', target: 'npm install' },
     },
+    parentMap: {
+        'test-agent-1': 'parent-1',
+        'test-agent-2': 'parent-1',
+        'test-agent-3': 'parent-1',
+    },
+    parentTitles: {
+        'parent-1': 'Main Development Chat',
+    },
 };
 
 const panelScript = buildPanelScript(injectionData);
@@ -172,6 +189,14 @@ assert(panelScript.includes('test-agent-1'), 'Contains agent ID');
 assert(panelScript.includes('test-hash-123'), 'Contains data hash');
 assert(panelScript.includes('__saCancelAction'), 'Contains cancel binding');
 assert(panelScript.includes('__saActionHandler'), 'Contains action binding');
+assert(panelScript.includes('parentMap'), 'Contains parentMap variable');
+assert(panelScript.includes('parentTitles'), 'Contains parentTitles variable');
+assert(panelScript.includes('Main Development Chat'), 'Contains parent title text');
+// Sections tracking
+assert(panelScript.includes('sections.chatbox'), 'Contains chatbox section status');
+assert(panelScript.includes('sections.watcher'), 'Contains watcher section status');
+assert(panelScript.includes('sections.sidebar'), 'Contains sidebar section status');
+assert(panelScript.includes('sections: sections'), 'Return value includes sections object');
 assert(isValidJS(panelScript), 'Is valid JavaScript');
 
 // Edge case: empty agents
@@ -182,6 +207,8 @@ const emptyData: PanelInjectionData = {
     dataHash: 'empty-hash',
     subAgentIds: [],
     pendingActions: {},
+    parentMap: {},
+    parentTitles: {},
 };
 const emptyScript = buildPanelScript(emptyData);
 assert(isValidJS(emptyScript), 'Empty agents: is valid JavaScript');
@@ -198,6 +225,8 @@ const specialData: PanelInjectionData = {
     dataHash: 'special-hash',
     subAgentIds: ['test-agent-1'],
     pendingActions: {},
+    parentMap: { 'test-agent-1': 'parent-1' },
+    parentTitles: { 'parent-1': 'Special "Chars" Chat' },
 };
 const specialScript = buildPanelScript(specialData);
 assert(isValidJS(specialScript), 'Special chars in task: is valid JavaScript');

@@ -21,18 +21,18 @@ import { CdpTarget, getTargets, loadWs, findBestTarget, setLogger } from './targ
 import { buildCSS } from './scripts/css';
 import { buildRouterSubscription } from './scripts/build-router-sub';
 import { buildPanelScript, PanelInjectionData, AgentUIData } from './scripts/build-panel-script';
+import { getHeartbeatInterval, getTargetRescanInterval, getUiPollInterval, getDebugLogging } from '../config/settings';
 
 // --- Configuration ---
 
 const CDP_PORT = 9347;
-const HEARTBEAT_INTERVAL = 10000;
-const TARGET_RESCAN_INTERVAL = 5000;
 const P = 'sa';
 
 // --- Output Channel ---
 
 let _outputChannel: vscode.OutputChannel | null = null;
 
+/** Always log — for critical messages (connections, errors, status changes) */
 function log(msg: string): void {
     if (!_outputChannel) {
         _outputChannel = vscode.window.createOutputChannel('Sub-Agents CDP');
@@ -40,6 +40,12 @@ function log(msg: string): void {
     const ts = new Date().toISOString().substring(11, 23);
     _outputChannel.appendLine(`[${ts}] ${msg}`);
     console.log(`[SubAgents:CDP] ${msg}`);
+}
+
+/** Debug-only log — gated by subagents.debugLogging setting */
+function logDebug(msg: string): void {
+    if (!getDebugLogging()) return;
+    log(msg);
 }
 
 // Set logger for target-manager module
@@ -73,6 +79,7 @@ export class CdpSidebarInjector implements vscode.Disposable {
     private _shellRetryTimer: NodeJS.Timeout | null = null;
     private _shellRetryCount = 0;
     private _switching = false;
+    private _parentTitleCache = new Map<string, string>();
 
     constructor(orchestrator: Orchestrator, port?: number) {
         this._orchestrator = orchestrator;
@@ -94,6 +101,7 @@ export class CdpSidebarInjector implements vscode.Disposable {
         if (this._eventDebounceTimer) clearTimeout(this._eventDebounceTimer);
         this._eventDebounceTimer = setTimeout(() => {
             this._lastDataHash = ''; // Force rebuild
+            this._shellRetryCount = 0; // Reset retries on new data
             if (this._connected) this.injectSubAgentPanel();
         }, 300);
     }
@@ -150,7 +158,7 @@ export class CdpSidebarInjector implements vscode.Disposable {
                     await this._connectToTarget(managerTarget, this._cdpPort || CDP_PORT);
                 }
             } catch { }
-        }, TARGET_RESCAN_INTERVAL);
+        }, getTargetRescanInterval());
     }
 
     private _stopTargetRescan(): void {
@@ -391,6 +399,8 @@ export class CdpSidebarInjector implements vscode.Disposable {
         this._lastRouterConvoId = id;
         log(`ROUTE CHANGED -> convo=${id ? id.substring(0, 8) : 'none'}`);
         this._lastDataHash = '';
+        this._shellRetryCount = 0; // Reset retries on route change
+        if (this._shellRetryTimer) { clearTimeout(this._shellRetryTimer); this._shellRetryTimer = null; }
         if (this._connected) {
             this.injectSubAgentPanel();
         }
@@ -458,6 +468,27 @@ export class CdpSidebarInjector implements vscode.Disposable {
             }
         }
 
+        // Parent map — subAgentId → parentId (for breadcrumb rewriting)
+        const parentMap: Record<string, string> = {};
+        for (const agent of agents) {
+            parentMap[agent.id] = agent.parentId;
+        }
+
+        // Parent titles — fetch from SDK (cached to avoid repeated RPC calls)
+        const uniqueParentIds = [...new Set(agents.map(a => a.parentId))];
+        for (const pid of uniqueParentIds) {
+            if (!this._parentTitleCache.has(pid)) {
+                const title = await this._orchestrator.getConversationTitle(pid);
+                if (title) {
+                    this._parentTitleCache.set(pid, title);
+                }
+            }
+        }
+        const parentTitles: Record<string, string> = {};
+        for (const pid of uniqueParentIds) {
+            parentTitles[pid] = this._parentTitleCache.get(pid) || 'Parent Chat';
+        }
+
         // Build injection script using modular builder
         const injectionData: PanelInjectionData = {
             prefix: P,
@@ -466,6 +497,10 @@ export class CdpSidebarInjector implements vscode.Disposable {
             dataHash,
             subAgentIds,
             pendingActions: pendingActionsMap,
+            parentMap,
+            parentTitles,
+            uiPollInterval: getUiPollInterval(),
+            debugLogging: getDebugLogging(),
         };
 
         const script = buildPanelScript(injectionData);
@@ -498,22 +533,37 @@ export class CdpSidebarInjector implements vscode.Disposable {
                     log(`UPDATED: ${d.filteredCount}/${d.totalAgentsInStore} agents for convo=${convoStr} (${res.activeCount} active) | agents=[${d.agentIds}]${d.createdShell ? ' [shell created]' : ''}`);
                 } else if (res.state === 'empty') {
                     log(`EMPTY: convo=${convoStr}`);
-                } else if (res.state === 'no-scroll-area') {
-                    log(`No scroll area found yet (retry ${this._shellRetryCount}/10)`);
-                    // Schedule retry — sidebar may not have rendered yet
-                    if (this._shellRetryCount < 10) {
-                        this._shellRetryCount++;
-                        if (this._shellRetryTimer) clearTimeout(this._shellRetryTimer);
-                        this._shellRetryTimer = setTimeout(() => {
-                            this._lastState = ''; // Force log on next attempt
-                            this._lastDataHash = '';
-                            this.injectSubAgentPanel();
-                        }, 2000);
-                    }
                 } else if (!res.ok) {
                     log(`ERROR: ${res.reason}`);
                 }
                 this._lastState = stateKey;
+
+                // Dump trace from browser-side script
+                if (d.trace && d.trace.length > 0) {
+                    for (const t of d.trace) {
+                        logDebug(`  ↳ ${t}`);
+                    }
+                }
+            }
+
+            // Per-section retry: if any section is incomplete, schedule a retry
+            const sections = res.sections || {};
+            const needsRetry =
+                sections.sidebar === 'no-scroll-area' ||
+                sections.chatbox === 'missing-inputbox';
+
+            if (needsRetry) {
+                this._shellRetryCount++;
+                // Throttle logs: first 5, then every 10th
+                if (this._shellRetryCount <= 5 || this._shellRetryCount % 10 === 0) {
+                    logDebug(`Scheduling retry ${this._shellRetryCount} (sidebar=${sections.sidebar}, chatbox=${sections.chatbox})`);
+                }
+                if (this._shellRetryTimer) clearTimeout(this._shellRetryTimer);
+                this._shellRetryTimer = setTimeout(() => {
+                    this._lastState = ''; // Force log on next attempt
+                    this._lastDataHash = '';
+                    this.injectSubAgentPanel();
+                }, 300);
             }
 
         } catch (err: any) {
@@ -627,7 +677,7 @@ export class CdpSidebarInjector implements vscode.Disposable {
                 try { this._ws?.close(); } catch { }
                 this._startRetryLoop();
             }
-        }, HEARTBEAT_INTERVAL);
+        }, getHeartbeatInterval());
     }
 
     private _stopHeartbeat(): void {

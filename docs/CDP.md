@@ -13,6 +13,8 @@ This document explains how the Antigravity Sub-Agents extension injects real-tim
 - [Script Builder Architecture](#script-builder-architecture)
 - [Trusted Types CSP Compliance](#trusted-types-csp-compliance)
 - [Router Subscription](#router-subscription)
+- [Self-Retrying Injection Sections](#self-retrying-injection-sections)
+- [Debug Logging](#debug-logging)
 - [Persistent UI Enforcement](#persistent-ui-enforcement)
 - [Chat Locking](#chat-locking)
 - [Setup Guide](#setup-guide)
@@ -143,7 +145,7 @@ The `_switching` flag prevents the close handler from triggering a reconnection 
 
 ### Heartbeat
 
-Every 10 seconds, the extension sends a no-op CDP call to verify the connection is alive. If the heartbeat fails, it triggers reconnection.
+At a configurable interval (`subagents.heartbeatInterval`, default 300ms), the extension sends a no-op CDP call to verify the connection is alive. If the heartbeat fails, it triggers reconnection.
 
 ## DOM Injection Strategy
 
@@ -266,7 +268,89 @@ if (router && router.subscribe) {
 }
 ```
 
-The `__saRouterChange` CDP binding forwards route events to the extension's TypeScript code (`cdp-injector.ts: _onRouterChange`), which triggers panel refreshes.
+The `__saRouterChange` CDP binding forwards route events to the extension's TypeScript code (`cdp-injector.ts: _onRouterChange`), which resets the retry counter and triggers panel refreshes.
+
+## Self-Retrying Injection Sections
+
+When the user switches conversations, React may not have rendered all DOM targets yet. The injection system handles this through **independent, per-section status tracking**.
+
+### Section Status Reporting
+
+The browser-side script tracks three independent sections:
+
+```javascript
+var sections = { chatbox: 'pending', watcher: 'pending', sidebar: 'pending' };
+```
+
+Each section reports its own outcome:
+
+| Section | Possible States | Retryable? |
+|---------|----------------|------------|
+| `chatbox` | `done`, `skip`, `cleared`, `missing-inputbox`, `no-convo` | `missing-inputbox` |
+| `watcher` | `installed`, `updated` | Never |
+| `sidebar` | `done`, `created`, `reused`, `no-scroll-area` | `no-scroll-area` |
+
+### Server-Side Retry Logic
+
+The `cdp-injector.ts` result handler checks the sections:
+
+```
+1. Parse result → extract sections object
+2. needsRetry = sidebar === 'no-scroll-area' || chatbox === 'missing-inputbox'
+3. If needsRetry → schedule retry at 300ms (uiPollInterval)
+4. On retry → re-execute full script (idempotent via data-sa-* guards)
+5. Completed sections skip instantly → no flicker
+```
+
+**Key guarantees:**
+- Retry counter resets to 0 on every route change and agent event.
+- No retry limit — retries continue indefinitely until all sections succeed.
+- Log throttling: first 5 retries logged individually, then every 10th.
+
+### State-Guard Data Attributes
+
+All DOM mutations are protected by `data-sa-*` attributes to prevent redundant re-processing:
+
+| Attribute | Element | Purpose |
+|-----------|---------|--------|
+| `data-sa-drop-hash` | Chatbox dropdown | Skip rebuild if agent set unchanged |
+| `data-sa-lock-state` | Lock target | Skip lock UI mutations if state unchanged |
+| `data-sa-badge-state` | `document.body` | Skip notification badge updates if unchanged |
+| `data-sa-breadcrumb` | Breadcrumb segment | Prevent breadcrumb re-rewriting |
+
+## Debug Logging
+
+All verbose logging is gated behind the `subagents.debugLogging` setting (default: `false`).
+
+### Server-Side (VS Code Output Channel)
+
+| Function | When |
+|----------|------|
+| `log()` | Always — connections, state changes, errors, route changes |
+| `logDebug()` | Only when `debugLogging: true` — trace dumps (`↳`), retry scheduling |
+
+### Browser-Side (Chromium DevTools Console)
+
+A `_saDebug` flag is injected into every script execution:
+
+```javascript
+var _saDebug = false; // or true when debugLogging enabled
+function _saLog(msg) {
+    _saTrace.push(msg);  // Always collect for debug results
+    if (_saDebug) console.log('[SA:panel] ' + msg);  // Only output when enabled
+}
+```
+
+All `[SA:watcher]` console.log calls are similarly gated with `if (_saDebug)`.
+
+### Enabling Debug Mode
+
+```json
+// settings.json
+{ "subagents.debugLogging": true }
+```
+
+Or via Settings UI → Extensions → Sub-Agents → Debug Logging.
 
 ## Persistent UI Enforcement
 
@@ -284,7 +368,7 @@ Any DOM change triggers our enforcement function.
 ### Layer 2: setInterval Fallback
 
 ```javascript
-setInterval(enforceLocks, 500);
+setInterval(enforceLocks, ${pollInterval}); // default 300ms, configurable via subagents.uiPollInterval
 ```
 
 Catches cases where MutationObserver misses a change.
@@ -398,6 +482,12 @@ Expected response:
 
 ### Connection Drops
 
-- The heartbeat timer (10s) will detect disconnections.
-- Auto-reconnection triggers within 10 seconds.
+- The heartbeat timer detects disconnections.
+- Auto-reconnection triggers automatically.
 - Check the output channel for reconnection logs.
+
+### Enabling Verbose Logs
+
+- Set `subagents.debugLogging` to `true` in Settings.
+- Browser-side `[SA:panel]` and `[SA:watcher]` logs appear in the Manager DevTools console.
+- Server-side `↳` trace dumps and retry logs appear in the "Sub-Agents CDP" output channel.

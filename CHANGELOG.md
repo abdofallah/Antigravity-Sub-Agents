@@ -5,6 +5,43 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] — 2026-05-26
+
+### Added
+
+- **Self-Retrying DOM Injection Sections** — Each injection concern (chatbox, sidebar, lock watcher) now reports its own status independently. If any section fails (e.g. sidebar not rendered yet), only that section is retried — completed sections skip via data-attribute state guards, eliminating flicker.
+  - Browser-side `sections` status object: `{ chatbox: 'done', watcher: 'updated', sidebar: 'no-scroll-area' }`.
+  - Possible states per section: `pending`, `done`, `skip`, `cleared`, `missing-inputbox`, `no-scroll-area`, `no-convo`, `installed`, `updated`, `created`, `reused`.
+  - Server-side retry scheduler checks `sections.sidebar` and `sections.chatbox` to determine retry need.
+- **`subagents.debugLogging` Setting** — Boolean toggle (default: `false`) that gates all verbose trace logging. When enabled, outputs detailed `[SA:panel]` and `[SA:watcher]` logs in browser DevTools and `↳` trace dumps in the VS Code output channel. When disabled, only critical logs (connections, state changes, errors) are shown.
+  - Server-side: new `logDebug()` function gates trace dumps and retry scheduling logs behind the setting.
+  - Browser-side: `_saDebug` flag injected into every script execution; `_saLog()` always populates the trace array (for debug results), but suppresses `console.log()` output in production.
+- **Configurable Poll Intervals** — All polling intervals are now extension settings with 300ms defaults:
+  - `subagents.uiPollInterval` — Browser-side DOM enforcement (badges, locks, breadcrumbs).
+  - `subagents.progressPollInterval` — Orchestrator progress polling.
+  - `subagents.statusPollInterval` — Extension status panel polling.
+  - `subagents.heartbeatInterval` — CDP connection heartbeat.
+  - `subagents.targetRescanInterval` — CDP target scanning.
+- **State-Guard Data Attributes** — All DOM mutations are now protected by `data-sa-*` attributes that prevent redundant re-processing:
+  - `data-sa-drop-hash` on the chatbox dropdown (skips rebuild if agent set unchanged).
+  - `data-sa-lock-state` on lock targets (skips lock UI mutations if state unchanged).
+  - `data-sa-badge-state` on the document body (skips notification badge updates if unchanged).
+  - `data-sa-breadcrumb` on breadcrumb segments (prevents re-rewriting).
+- **4 new CDP smoke test assertions** — Validate `sections.chatbox`, `sections.watcher`, `sections.sidebar` tracking and `sections: sections` in return values. Total tests: **37**.
+
+### Fixed
+
+- **Sidebar blank after conversation switch** — The injection script used to return early when the sidebar scroll area wasn't found (`no-scroll-area`), causing the chatbox dropdown to also be skipped. Now the sidebar sets its section status and continues, so the chatbox is always processed.
+- **Retry counter never reset** — `_shellRetryCount` was a lifetime counter that never reset on route changes or agent events. After enough conversation switches, the extension permanently stopped retrying. Now resets to 0 on every route change and agent event.
+- **2-second retry interval too slow** — Previous retry used 2000ms delays. Now uses 300ms, aligned with the configurable `uiPollInterval`.
+- **Retry limit exhaustion** — Removed the fixed 20-retry cap. Retries now continue indefinitely until the section succeeds, with log throttling (first 5, then every 10th) to prevent output spam.
+
+### Changed
+
+- **Retry interval** — Changed from 2000ms to 300ms for faster DOM convergence after conversation switches.
+- **Log architecture** — Split `log()` into `log()` (always) and `logDebug()` (gated) in `cdp-injector.ts`. Browser-side logs are gated by `_saDebug` flag.
+- **Panel script return value** — Now includes `sections` object alongside existing `state`, `count`, `activeCount` fields.
+
 ## [0.5.0] — 2026-05-26
 
 ### Added
@@ -166,6 +203,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - MutationObserver + setInterval watchers for persistent UI enforcement.
 - Background poll loop with trajectory summary diffing for progress tracking.
 
+[0.6.0]: https://github.com/abdofallah/Antigravity-Sub-Agents/releases/tag/v0.6.0
 [0.5.0]: https://github.com/abdofallah/Antigravity-Sub-Agents/releases/tag/v0.5.0
 [0.4.0]: https://github.com/abdofallah/Antigravity-Sub-Agents/releases/tag/v0.4.0
 [0.3.0]: https://github.com/abdofallah/Antigravity-Sub-Agents/releases/tag/v0.3.0

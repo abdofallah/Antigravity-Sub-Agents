@@ -76,7 +76,7 @@ src/
 │   └── actions.ts                Cancel, approve, respond, reject, viewChat
 │
 └── tests/                        ─── Validation ───
-    └── cdp-scripts.test.ts       24 CDP script smoke tests
+    └── cdp-scripts.test.ts       37 CDP script smoke tests
 ```
 
 ## Module Breakdown
@@ -217,7 +217,7 @@ Centralized configuration management:
 
 | Module | Role |
 |--------|------|
-| `settings.ts` | `getConfig()`, `getCdpPort()`, `getDefaultModel()`, model maps |
+| `settings.ts` | `getConfig()`, `getCdpPort()`, `getDefaultModel()`, poll intervals, `getDebugLogging()`, model maps |
 | `mcp-config.ts` | Find/write/auto-fix MCP config, health queries, LS refresh |
 | `instructions.ts` | Write `instructions.md` for MCP prompt injection |
 
@@ -332,6 +332,12 @@ messaging.ts:
 | `subagents.cdpPort` | number | `9347` | CDP debugging port |
 | `subagents.autoConnectCDP` | boolean | `true` | Auto-connect on startup |
 | `subagents.autoInstallMCP` | boolean | `true` | Auto-install MCP config |
+| `subagents.uiPollInterval` | number | `300` | Browser-side DOM enforcement interval (ms) |
+| `subagents.progressPollInterval` | number | `300` | Orchestrator progress poll interval (ms) |
+| `subagents.statusPollInterval` | number | `300` | Extension status panel poll interval (ms) |
+| `subagents.heartbeatInterval` | number | `300` | CDP connection heartbeat interval (ms) |
+| `subagents.targetRescanInterval` | number | `300` | CDP target scan interval (ms) |
+| `subagents.debugLogging` | boolean | `false` | Enable verbose trace logging (browser + output channel) |
 
 ## Dependencies
 
@@ -347,7 +353,7 @@ The SDK is **bundled** into the extension (`noExternal` in tsup config) so users
 
 | Script | Purpose |
 |--------|---------|
-| `npm run build` | tsup bundle + CDP smoke tests (24 tests) |
+| `npm run build` | tsup bundle + CDP smoke tests (37 tests) |
 | `npm run build:only` | tsup bundle only (no tests) |
 | `npm run dev` | Watch mode (rebuilds on changes) |
 | `npm run test` | Run all tests |

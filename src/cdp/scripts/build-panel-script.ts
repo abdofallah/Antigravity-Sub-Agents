@@ -45,6 +45,14 @@ export interface PanelInjectionData {
     dataHash: string;
     subAgentIds: string[];
     pendingActions: Record<string, { actionType: string; target: string }>;
+    /** Maps sub-agent cascadeId → parent cascadeId */
+    parentMap: Record<string, string>;
+    /** Maps parent cascadeId → human-readable title */
+    parentTitles: Record<string, string>;
+    /** Browser-side DOM enforcement poll interval (ms) */
+    uiPollInterval?: number;
+    /** Whether debug logging is enabled in browser console */
+    debugLogging?: boolean;
 }
 
 /**
@@ -52,12 +60,12 @@ export interface PanelInjectionData {
  * Returns a complete self-executing JavaScript IIFE string.
  */
 export function buildPanelScript(data: PanelInjectionData): string {
-    const { prefix, agents, visibleLimit, dataHash, subAgentIds, pendingActions } = data;
+    const { prefix, agents, visibleLimit, dataHash, subAgentIds, pendingActions, parentMap, parentTitles, uiPollInterval, debugLogging } = data;
     const dataJson = JSON.stringify(agents);
 
     // The chatbox UI fragment and lock watcher fragment
     const chatboxFragment = buildChatboxUI();
-    const lockWatcherFragment = buildLockWatcher();
+    const lockWatcherFragment = buildLockWatcher(uiPollInterval || 300);
 
     return `(() => {
             try {
@@ -67,7 +75,13 @@ export function buildPanelScript(data: PanelInjectionData): string {
                 var dataHash = '${dataHash}';
                 var subAgentIds = ${JSON.stringify(subAgentIds)};
                 var pendingActions = ${JSON.stringify(pendingActions)};
+                var parentMap = ${JSON.stringify(parentMap)};
+                var parentTitles = ${JSON.stringify(parentTitles)};
                 var debug = {};
+                var sections = { chatbox: 'pending', watcher: 'pending', sidebar: 'pending' };
+                var _saDebug = ${debugLogging ? 'true' : 'false'};
+                var _saTrace = [];
+                function _saLog(msg) { _saTrace.push(msg); if (_saDebug) console.log('[SA:panel] ' + msg); }
 
                 if (!window.__saState) window.__saState = {};
                 var uiState = window.__saState;
@@ -96,14 +110,19 @@ export function buildPanelScript(data: PanelInjectionData): string {
                 if (!activeConvoId) {
                     var pill = document.querySelector('[role="button"][class*="bg-list-hover"] span[data-testid^="convo-pill-"]');
                     if (pill) activeConvoId = (pill.getAttribute('data-testid') || '').replace('convo-pill-', '');
+                    _saLog('convo from pill fallback: ' + (activeConvoId ? activeConvoId.substring(0,8) : 'none'));
+                } else {
+                    _saLog('convo from router: ' + activeConvoId.substring(0,8));
                 }
                 debug.activeConvoId = activeConvoId ? activeConvoId.substring(0, 8) : 'none';
 
                 // Hash check - skip if nothing changed
                 var fullHash = dataHash + '|' + (activeConvoId || 'none');
                 if (uiState._dataHash === fullHash && document.getElementById(P + '-section')) {
+                    _saLog('hash unchanged, skip (' + fullHash.substring(0,20) + ')');
                     return JSON.stringify({ ok: true, state: 'unchanged' });
                 }
+                _saLog('hash changed: ' + (uiState._dataHash || 'none').substring(0,20) + ' -> ' + fullHash.substring(0,20));
                 uiState._dataHash = fullHash;
 
                 // Filter & sort agents for active conversation
@@ -117,9 +136,11 @@ export function buildPanelScript(data: PanelInjectionData): string {
                 var activeCount = agents.filter(function(a) { return a.isActive; }).length;
                 var totalCount = agents.length;
                 var hiddenCount = Math.max(0, totalCount - LIMIT);
+                _saLog('agents: ' + totalCount + ' total, ' + activeCount + ' active, ' + hiddenCount + ' hidden (allAgents=' + allAgents.length + ')');
 
                 // Reset UI state on conversation change
                 if (uiState.lastConvoId && uiState.lastConvoId !== activeConvoId) {
+                    _saLog('convo changed: ' + (uiState.lastConvoId || 'none').substring(0,8) + ' -> ' + (activeConvoId || 'none').substring(0,8) + ' — resetting UI state');
                     uiState.collapsed = false;
                     uiState.expanded = false;
                     uiState.dropdownCollapsed = false;
@@ -264,6 +285,7 @@ ${lockWatcherFragment}
                 var itemsList = section ? document.getElementById(P + '-items') : null;
                 var badge = section ? document.getElementById(P + '-badge') : null;
                 var runBadge = section ? document.getElementById(P + '-run-badge') : null;
+                _saLog('phase1: section=' + (section ? 'exists' : 'missing') + ', itemsList=' + (itemsList ? 'exists' : 'missing'));
 
                 if (!section) {
                     // Find scroll area in right sidebar
@@ -279,9 +301,11 @@ ${lockWatcherFragment}
                         }
                     }
                     var scrollArea = rp ? rp.querySelector('[class*="overflow-y-auto"]') : null;
+                    _saLog('phase1: panels=' + allPanels.length + ', rp=' + (rp ? 'found' : 'missing') + ', scrollArea=' + (scrollArea ? 'found' : 'missing'));
                     if (!scrollArea) {
-                        return JSON.stringify({ ok: true, state: 'no-scroll-area', debug: debug });
-                    }
+                        _saLog('phase1: no scroll area — sidebar deferred');
+                        sections.sidebar = 'no-scroll-area';
+                    } else {
 
                     // Build shell
                     section = el('div', 'w-full flex flex-col gap-2');
@@ -325,11 +349,19 @@ ${lockWatcherFragment}
                     else scrollArea.appendChild(section);
 
                     debug.createdShell = true;
+                    sections.sidebar = 'created';
+                    _saLog('phase1: shell created and inserted into scrollArea');
+                    } // end scrollArea found block
+                } else {
+                    sections.sidebar = 'reused';
+                    _saLog('phase1: reusing existing shell');
                 }
 
                 // ========================================
                 // Phase 2: Update children in place
+                // (only runs if sidebar section exists)
                 // ========================================
+                if (sections.sidebar !== 'no-scroll-area') {
 
                 // Update badge counts
                 if (badge) badge.textContent = '' + totalCount;
@@ -337,6 +369,7 @@ ${lockWatcherFragment}
                     if (activeCount > 0) { runBadge.textContent = activeCount + ' running'; runBadge.style.display = ''; }
                     else { runBadge.style.display = 'none'; }
                 }
+                _saLog('phase2: badge=' + totalCount + ', runBadge=' + (activeCount > 0 ? activeCount + ' running' : 'hidden'));
 
                 // Clear existing rows
                 if (itemsList) while (itemsList.firstChild) itemsList.removeChild(itemsList.firstChild);
@@ -519,8 +552,15 @@ ${lockWatcherFragment}
                 if (wr && uiState.collapsed) { wr.style.display = 'none'; if (cv) cv.textContent = 'chevron_right'; }
 
                 debug.agentIds = agents.map(function(a) { return a.id.substring(0, 8); }).join(',');
+                if (sections.sidebar === 'created' || sections.sidebar === 'reused') sections.sidebar = 'done';
 
-                return JSON.stringify({ ok: true, state: totalCount > 0 ? 'updated' : 'empty', count: totalCount, activeCount: activeCount, debug: debug });
+                } // end phase 2 (sidebar !== no-scroll-area)
+
+                debug.sections = sections;
+                debug.trace = _saTrace;
+
+                _saLog('done: sections=' + JSON.stringify(sections) + ', count=' + totalCount + ', active=' + activeCount);
+                return JSON.stringify({ ok: true, state: totalCount > 0 ? 'updated' : 'empty', sections: sections, count: totalCount, activeCount: activeCount, debug: debug });
             } catch (e) {
                 return JSON.stringify({ ok: false, reason: e.message, stack: e.stack ? e.stack.substring(0, 300) : '' });
             }

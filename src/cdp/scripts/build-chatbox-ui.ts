@@ -23,14 +23,28 @@ export function buildChatboxUI(): string {
                 // --- Active agents: connected section inside chat input box ---
                 var inputBox = document.getElementById('antigravity.agentSidePanelInputBox');
                 var oldDrop = document.getElementById(P + '-running-dropdown');
-                if (oldDrop) oldDrop.remove();
 
                 var activeAgents = agents.filter(function(a) { return a.status === 'running' || a.status === 'waiting_for_action'; });
                 var runningAgents = agents.filter(function(a) { return a.status === 'running'; });
                 var waitingAgents = agents.filter(function(a) { return a.status === 'waiting_for_action'; });
                 var activeCount = activeAgents.length;
+                _saLog('chatbox: inputBox=' + (inputBox ? 'found' : 'MISSING') + ', oldDrop=' + (oldDrop ? 'exists' : 'none') + ', active=' + activeAgents.length + ' (running=' + runningAgents.length + ', waiting=' + waitingAgents.length + ')');
 
-                if (inputBox && activeCount > 0) {
+                // State guard: skip chatbox rebuild if agent set hasn't changed
+                var dropHash = activeAgents.map(function(a) { return a.id + ':' + a.status + ':' + (a.steps || 0); }).join(',');
+
+                if (!inputBox) {
+                    // Input box not yet rendered — retryable
+                    sections.chatbox = activeConvoId ? 'missing-inputbox' : 'no-convo';
+                    _saLog('chatbox: ' + sections.chatbox);
+                } else if (oldDrop && oldDrop.getAttribute('data-sa-drop-hash') === dropHash) {
+                    sections.chatbox = 'skip';
+                    _saLog('chatbox: hash unchanged, skip rebuild');
+                } else {
+                    _saLog('chatbox: hash changed -> rebuilding dropdown (hash=' + dropHash.substring(0,30) + ')');
+                    if (oldDrop) oldDrop.remove();
+
+                    if (activeCount > 0) {
                     var _ns = 'http://www.w3.org/2000/svg';
 
                     // Build a row specifically styled for the chatbox connected section
@@ -156,6 +170,7 @@ export function buildChatboxUI(): string {
                     // ── Outer wrapper: injected as the top section of the input box ──
                     var dd = el('div', 'flex flex-col px-3 w-full');
                     dd.id = P + '-running-dropdown';
+                    dd.setAttribute('data-sa-drop-hash', dropHash);
                     dd.style.cssText = 'padding-top:6px;padding-bottom:4px;';
 
                     // ── Summary header button with chevron ──
@@ -272,19 +287,16 @@ export function buildChatboxUI(): string {
                     } else {
                         inputBox.appendChild(dd);
                     }
+                    _saLog('chatbox: dropdown inserted into inputBox');
+                    sections.chatbox = 'done';
+                } else {
+                    // No active agents — clear stale dropdown
+                    sections.chatbox = 'cleared';
+                    _saLog('chatbox: no active agents, cleared');
                 }
+                } // end chatbox else (hash changed branch)
 
-                // --- Notification badge on parent chat in left sidebar ---
-                var oldBadges = document.querySelectorAll('.' + P + '-chat-notify');
-                oldBadges.forEach(function(b) { b.remove(); });
-                if (waitingAgents.length > 0 && activeConvoId) {
-                    var pill = document.querySelector('span[data-testid="convo-pill-' + activeConvoId + '"]');
-                    if (pill) {
-                        var notifBadgeEl = el('span', P + '-chat-notify google-symbols');
-                        notifBadgeEl.textContent = 'notifications';
-                        notifBadgeEl.style.cssText = 'display:inline-flex;align-items:center;justify-content:center;font-size:14px;color:#fbbf24;margin-right:4px;animation:' + P + '-pulse 1.5s ease-in-out infinite;flex-shrink:0;';
-                        pill.parentNode.insertBefore(notifBadgeEl, pill);
-                    }
-                }
+                // NOTE: Sidebar notification badges are handled by the lock watcher (300ms poll)
+                // to ensure they persist across all conversations, not just the active one.
 `;
 }
