@@ -79,6 +79,7 @@ export class CdpSidebarInjector implements vscode.Disposable {
     private _shellRetryTimer: NodeJS.Timeout | null = null;
     private _shellRetryCount = 0;
     private _switching = false;
+    private _injecting = false;
     private _parentTitleCache = new Map<string, string>();
 
     constructor(orchestrator: Orchestrator, port?: number) {
@@ -99,6 +100,8 @@ export class CdpSidebarInjector implements vscode.Disposable {
      */
     private _onAgentEvent(): void {
         if (this._eventDebounceTimer) clearTimeout(this._eventDebounceTimer);
+        // Cancel any pending retry — fresh data supersedes stale retry
+        if (this._shellRetryTimer) { clearTimeout(this._shellRetryTimer); this._shellRetryTimer = null; }
         this._eventDebounceTimer = setTimeout(() => {
             this._lastDataHash = ''; // Force rebuild
             this._shellRetryCount = 0; // Reset retries on new data
@@ -410,6 +413,18 @@ export class CdpSidebarInjector implements vscode.Disposable {
 
     async injectSubAgentPanel(): Promise<void> {
         if (!this._connected || !this._ws) return;
+        // Mutex: prevent concurrent injections from racing
+        if (this._injecting) return;
+        this._injecting = true;
+        try {
+            await this._injectSubAgentPanelInner();
+        } finally {
+            this._injecting = false;
+        }
+    }
+
+    private async _injectSubAgentPanelInner(): Promise<void> {
+        if (!this._connected || !this._ws) return;
 
         if (!this._cssInjected) {
             await this._injectCSS();
@@ -552,7 +567,10 @@ export class CdpSidebarInjector implements vscode.Disposable {
                 sections.sidebar === 'no-scroll-area' ||
                 sections.chatbox === 'missing-inputbox';
 
-            if (needsRetry) {
+            // Don't retry if the right panel itself is missing — sidebar is closed by the user
+            const rpMissing = d.trace?.some((t: string) => t.includes('rp=missing'));
+
+            if (needsRetry && !rpMissing) {
                 this._shellRetryCount++;
                 // Throttle logs: first 5, then every 10th
                 if (this._shellRetryCount <= 5 || this._shellRetryCount % 10 === 0) {
