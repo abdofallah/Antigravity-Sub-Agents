@@ -82,6 +82,12 @@ export class CdpSidebarInjector implements vscode.Disposable {
     private _injecting = false;
     private _parentTitleCache = new Map<string, string>();
 
+    // Inflight guards — prevent async-in-interval overlaps
+    private _retryInflight = false;
+    private _rescanInflight = false;
+    private _heartbeatInflight = false;
+    private _refreshTimers: NodeJS.Timeout[] = [];
+
     constructor(orchestrator: Orchestrator, port?: number) {
         this._orchestrator = orchestrator;
         if (port) this._cdpPort = port;
@@ -126,10 +132,13 @@ export class CdpSidebarInjector implements vscode.Disposable {
     private _startRetryLoop(): void {
         this._stopRetryLoop();
         this._retryTimer = setInterval(async () => {
-            if (this._disposed || this._connected) return;
-            const ok = await this._tryAllPorts();
-            if (ok) {
-                this._stopRetryLoop();
+            if (this._disposed || this._connected || this._retryInflight) return;
+            this._retryInflight = true;
+            try {
+                const ok = await this._tryAllPorts();
+                if (ok) this._stopRetryLoop();
+            } finally {
+                this._retryInflight = false;
             }
         }, 10000);
     }
@@ -141,7 +150,8 @@ export class CdpSidebarInjector implements vscode.Disposable {
     private _startTargetRescan(): void {
         this._stopTargetRescan();
         this._rescanTimer = setInterval(async () => {
-            if (this._disposed || !this._connected) return;
+            if (this._disposed || !this._connected || this._rescanInflight) return;
+            this._rescanInflight = true;
             try {
                 const targets = await getTargets(this._cdpPort || CDP_PORT);
                 const managerTarget = targets.find((t: CdpTarget) => t.type === 'page' && t.title === 'Manager');
@@ -161,6 +171,9 @@ export class CdpSidebarInjector implements vscode.Disposable {
                     await this._connectToTarget(managerTarget, this._cdpPort || CDP_PORT);
                 }
             } catch { }
+            finally {
+                this._rescanInflight = false;
+            }
         }, getTargetRescanInterval());
     }
 
@@ -664,23 +677,26 @@ export class CdpSidebarInjector implements vscode.Disposable {
     private _startRefreshLoop(): void {
         this._stopRefreshLoop();
         this._shellRetryCount = 0;
-        // Graduated retries: 1.5s, 4s, 8s
+        // Graduated retries: 1.5s, 4s, 8s — stored so _stopRefreshLoop can cancel them
         const delays = [1500, 4000, 8000];
-        delays.forEach(delay => {
-            setTimeout(() => {
+        for (const delay of delays) {
+            this._refreshTimers.push(setTimeout(() => {
                 if (this._connected) this.injectSubAgentPanel();
-            }, delay);
-        });
+            }, delay));
+        }
     }
 
     private _stopRefreshLoop(): void {
+        for (const t of this._refreshTimers) clearTimeout(t);
+        this._refreshTimers = [];
         if (this._shellRetryTimer) { clearTimeout(this._shellRetryTimer); this._shellRetryTimer = null; }
     }
 
     private _startHeartbeat(): void {
         this._stopHeartbeat();
         this._heartbeatTimer = setInterval(async () => {
-            if (!this._connected || this._disposed) return;
+            if (!this._connected || this._disposed || this._heartbeatInflight) return;
+            this._heartbeatInflight = true;
             try {
                 await this._cdpCall('Runtime.evaluate', {
                     expression: '1+1',
@@ -694,6 +710,8 @@ export class CdpSidebarInjector implements vscode.Disposable {
                 this._lastState = '';
                 try { this._ws?.close(); } catch { }
                 this._startRetryLoop();
+            } finally {
+                this._heartbeatInflight = false;
             }
         }, getHeartbeatInterval());
     }
@@ -718,6 +736,7 @@ export class CdpSidebarInjector implements vscode.Disposable {
         this._stopTargetRescan();
         if (this._eventSub) { this._eventSub.dispose(); this._eventSub = null; }
         if (this._eventDebounceTimer) { clearTimeout(this._eventDebounceTimer); this._eventDebounceTimer = null; }
+        if (this._shellRetryTimer) { clearTimeout(this._shellRetryTimer); this._shellRetryTimer = null; }
         if (this._ws) {
             try { this._ws.close(); } catch { }
             this._ws = null;
