@@ -9,6 +9,30 @@
 
 import { Models, ModelId } from 'antigravity-sdk';
 
+// ─── Sentinels ──────────────────────────────────────────────────────────
+
+/**
+ * Sentinel error string used when an agent is marked Failed because the
+ * extension restarted and lost its in-memory tracking.
+ *
+ * The recovery logic uses this exact string to find agents that should be
+ * re-checked against the Language Server's live trajectory state.
+ */
+export const LOST_TRACKING_ERROR = 'Extension restarted — lost tracking';
+
+/**
+ * Sentinel error string used when an agent was waiting for user approval and
+ * the Antigravity IDE auto-cancelled the pending interaction on its own restart.
+ *
+ * This is native IDE behaviour, not something our extension does — but we MUST
+ * detect it so we (a) show the correct terminal state (Cancelled, not
+ * Completed), and (b) suppress the spurious "Report sent to parent" delivery
+ * since the sub-agent never actually finished any work. Mirrors the
+ * PARENT_STOPPED pattern in actions.ts.
+ */
+export const IDE_CANCELLED_ERROR = 'IDE_CANCELLED: Pending action was auto-cancelled by the IDE on restart.';
+
+
 // ─── Sub-Agent Lifecycle ────────────────────────────────────────────────
 
 /**

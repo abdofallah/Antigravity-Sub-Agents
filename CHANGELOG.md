@@ -5,6 +5,38 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.0] — 2026-05-27
+
+### Added
+
+- **Restart Recovery** — On extension activation, every sub-agent that was previously marked `Failed ("Extension restarted — lost tracking")` is now re-checked against the Language Server's live trajectory state. Healthy cascades are restored to the right live status (`Running` / `WaitingForAction` / `Completed` / `Cancelled`) and monitoring resumes automatically — no manual relaunch required.
+  - Phase 1: `listCascades` summary fetch confirms the cascade still exists on the LS side.
+  - Phase 2: `getConversation` full fetch supplies `waitingSteps` / `requestedInteractions` so `WaitingForAction` can be distinguished from `Completed`.
+  - Diagnostic `[RECOVERY-DUMP]` lines emit persisted-state and live-state snapshots side-by-side for every checked agent.
+- **`IDE_CANCELLED_ERROR` Sentinel** — Detects when the Antigravity IDE itself auto-cancelled a pending user-interaction during its own restart (verified with the extension fully disabled: same behaviour). Affected sub-agents are now correctly terminated as `Cancelled` rather than `Completed`, and the batch-delivery layer suppresses the spurious "Report sent to parent" message since the sub-agent never ran its post-approval steps. Mirrors the `PARENT_STOPPED` silent-cancel pattern.
+- **`LOST_TRACKING_ERROR` Sentinel** — Centralised the "Extension restarted — lost tracking" magic string into a single exported constant so recovery, persistence, and UI layers can never drift out of sync.
+- **Strictly-Monotonic Injection Sequence** — Every CDP panel injection now carries an `_injectSeq` payload that the browser-side script uses to reject out-of-order evaluations. Eliminates the class of bug where a fast route switch let a late-completing injection from the previous conversation overwrite the fresh one.
+- **Route Generation Guards** — Every route change increments `_routeGeneration`. All inflight timers, debounced injections, and graduated-retry chains stamp the generation at scheduling time and self-discard when it no longer matches — stale results from the previous conversation can no longer pollute the current view.
+- **High-Water Mark Anti-Wipe Guard** — The injector now records `_lastInjectedActiveCount` and `_lastInjectedAt` for the current route. A subsequent injection that would shrink the visible active-agent set within a short coalescing window is dropped on the browser side, preventing the flash-empty bug seen when navigating away and back to a conversation with running sub-agents.
+- **Pending-Injection Queue** — Route or agent events arriving while a CDP call is inflight no longer drop silently; they queue a single follow-up run that fires with fresh data immediately after the inflight call returns.
+- **TreeView Diagnostic Trace Channel** — New "Sub-Agents TreeView" output channel (gated by `subagents.debugLogging`) logs every event subscription, refresh, and `getChildren` call from `ActiveTreeProvider` and `HistoryTreeProvider`, including batch-by-batch agent-state dumps when the filter empties out. Created during the v0.7.0 diagnosis cycle and kept available for future support cases.
+- **Activation Provider Logs** — `extension.ts` now logs each tree provider's construction and view registration. Makes it trivial to verify which orchestrator instance the providers received in support reports.
+- **`.github/antigravity subagents extension.mp4`** — Demo video embedded at the top of the README so users can see the extension in action before installing.
+
+### Fixed
+
+- **"Lost-tracking" agents wrongly marked Completed on restart** — Earlier revisions queried `GetAllCascadeTrajectories` which never returns `waitingSteps`, so any agent that had been `WaitingForAction` was demoted to `Completed`. Recovery now uses `GetConversation` as the authoritative source.
+- **Non-conversation routes (`/`, `/history`) entered a futile retry loop** — These pages have no sidebar or chatbox to inject into. The injector now exits cleanly when no `cascadeId` is present in the router and just resets the per-route state without scheduling retries.
+- **Active-agent panel flashed empty after switching conversations and back** — The root cause was a stale `Shell created = true` triggering a redundant re-injection that ran the chatbox / sidebar code path with an empty agent set. Fixed via the high-water mark, route generation guard, and injection-sequence number working together.
+- **Per-route state leaked between conversations** — `_shellRetryCount`, `_eventDebounceTimer`, `_refreshTimers`, `_lastInjectedActiveCount`, and `_lastInjectedAt` are now all reset on every route change.
+- **CHANGELOG.md** — Corrected outdated CDP smoke-test counts to keep the number in lockstep with `src/tests/cdp-scripts.test.ts`.
+
+### Changed
+
+- **`recoverLostAgents` priority order** is now explicit and documented in code: Priority 0 = IDE auto-cancelled pending action, Priority 1 = `waitingSteps` present → `WaitingForAction`, Priority 2 = IDE + step progress → silent `Completed`, Default = revive as `Running` and let the standing monitor disambiguate.
+- **Tree-provider event listeners** were rewritten to log subscription, refresh, and `getChildren` call counts behind `subagents.debugLogging`. Behaviour is unchanged when the flag is off.
+- **Orchestrator delivery layer** (`checkBatchDelivery`) now short-circuits when every agent in a batch is IDE-cancelled (alongside the existing PARENT_STOPPED short-circuit).
+
 ## [0.6.0] — 2026-05-26
 
 ### Added
@@ -203,6 +235,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - MutationObserver + setInterval watchers for persistent UI enforcement.
 - Background poll loop with trajectory summary diffing for progress tracking.
 
+[0.7.0]: https://github.com/abdofallah/Antigravity-Sub-Agents/releases/tag/v0.7.0
 [0.6.0]: https://github.com/abdofallah/Antigravity-Sub-Agents/releases/tag/v0.6.0
 [0.5.0]: https://github.com/abdofallah/Antigravity-Sub-Agents/releases/tag/v0.5.0
 [0.4.0]: https://github.com/abdofallah/Antigravity-Sub-Agents/releases/tag/v0.4.0

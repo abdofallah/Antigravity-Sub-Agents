@@ -56,7 +56,7 @@ function log(msg: string): void {
 }
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
-    // ─── Output Channel ──────────────────────────────────────────
+    // ─── Output Channel ───────────────────────────────
     _out = vscode.window.createOutputChannel('Sub-Agents');
     context.subscriptions.push(_out);
     log('Activating Sub-Agents extension...');
@@ -91,10 +91,24 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     orchestrator = new Orchestrator(sdk, context);
     context.subscriptions.push(orchestrator);
 
-    // ─── TreeView Sidebar ───────────────────────────────────────────
+    // ─── Restart Recovery (one-shot, fire-and-forget) ────────────────
+    // Sub-agents flagged Failed("Extension restarted — lost tracking") during
+    // _restoreState are re-checked against the LS: still-alive cascades are
+    // restored to Running/WaitingForAction/Completed and monitoring resumes.
+    orchestrator.recoverLostAgents()
+        .then(({ checked, recovered }) => {
+            if (checked > 0) {
+                log(`Restart recovery: ${recovered}/${checked} sub-agents restored from LS`);
+            }
+        })
+        .catch(err => log(`Restart recovery failed: ${err?.message}`));
+
+    // ─── TreeView Sidebar ──────────────────────────────────
+    log(`Creating TreeView providers — orchestrator type=${typeof orchestrator}, hasOnEvent=${typeof (orchestrator as any).onEvent}`);
     const statusTree = new StatusTreeProvider();
     const activeTree = new ActiveTreeProvider(orchestrator);
     const historyTree = new HistoryTreeProvider(orchestrator);
+    log(`TreeView providers created: status=${!!statusTree} active=${!!activeTree} history=${!!historyTree}`);
 
     const statusView = vscode.window.createTreeView('subagents.status', {
         treeDataProvider: statusTree,
@@ -108,6 +122,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         treeDataProvider: historyTree,
         showCollapseAll: false,
     });
+    log(`TreeViews registered: subagents.status, subagents.active, subagents.history`);
 
     context.subscriptions.push(statusView, activeView, historyView, statusTree, activeTree, historyTree);
 

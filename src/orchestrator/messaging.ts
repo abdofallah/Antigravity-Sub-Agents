@@ -16,6 +16,7 @@ import {
     IMessageBuffer,
     SubAgentStatus,
     isTerminalStatus,
+    IDE_CANCELLED_ERROR,
 } from '../types';
 
 /** Shared state context passed from the Orchestrator class */
@@ -109,6 +110,15 @@ export async function checkBatchDelivery(ctx: MessagingContext, batchId: string)
         );
         if (allParentStopped) {
             ctx.out.appendLine(`[DELIVERY] Batch ${batchId.substring(0, 12)}: all parent-stopped, skipping delivery`);
+            ctx.deliveredBatches.add(batchId);
+            return false;
+        }
+        // All IDE-cancelled on restart (silent — sub-agents never ran the work)
+        const allIdeCancelled = batchAgents.every(a =>
+            a.status === SubAgentStatus.Cancelled && a.error === IDE_CANCELLED_ERROR
+        );
+        if (allIdeCancelled) {
+            ctx.out.appendLine(`[DELIVERY] Batch ${batchId.substring(0, 12)}: all IDE-cancelled on restart, skipping delivery`);
             ctx.deliveredBatches.add(batchId);
             return false;
         }

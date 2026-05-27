@@ -13,6 +13,7 @@ This document explains how the Antigravity Sub-Agents extension injects real-tim
 - [Script Builder Architecture](#script-builder-architecture)
 - [Trusted Types CSP Compliance](#trusted-types-csp-compliance)
 - [Router Subscription](#router-subscription)
+- [Route Coherence & Anti-Wipe Guards](#route-coherence--anti-wipe-guards)
 - [Self-Retrying Injection Sections](#self-retrying-injection-sections)
 - [Debug Logging](#debug-logging)
 - [Persistent UI Enforcement](#persistent-ui-enforcement)
@@ -269,6 +270,44 @@ if (router && router.subscribe) {
 ```
 
 The `__saRouterChange` CDP binding forwards route events to the extension's TypeScript code (`cdp-injector.ts: _onRouterChange`), which resets the retry counter and triggers panel refreshes.
+
+## Route Coherence & Anti-Wipe Guards
+
+Fast conversation switches — e.g. clicking from `chat A` to `/history` and back — used to produce a flash-empty panel because a late CDP evaluation from the previous route landed after the new route's injection. The v0.7.0 injector defends against this on three levels.
+
+### 1. Strictly-Monotonic Injection Sequence (`_injectSeq`)
+
+Every `_injectSubAgentPanelInner` dispatch increments a process-lifetime counter and stamps the payload with it. The browser-side panel script reads the sequence and rejects any incoming script whose `seq` is less than the latest one it has applied. Out-of-order results are dropped silently — no DOM mutations, no `_lastInjectedHash` update.
+
+### 2. Route Generation (`_routeGeneration`)
+
+Every route change bumps `_routeGeneration`. All timers, debounced injections, and graduated-retry chains stamp the current generation at scheduling time and self-discard if it changes:
+
+```typescript
+const eventGen = this._routeGeneration;
+// ... later, after async work ...
+if (this._routeGeneration !== eventGen) return; // Route changed — discard
+```
+
+On each route change, the injector also actively cancels `_eventDebounceTimer` and clears all `_refreshTimers`, so the retry chains from the previous route don't even get the chance to fire.
+
+### 3. High-Water Mark Anti-Wipe (`_lastInjectedActiveCount` + `_lastInjectedAt`)
+
+If an injection would shrink the visible active-agent set within a short coalescing window, it is dropped on the browser side. This kills the specific bug where:
+
+- Conversation A has 1 running sub-agent → injection renders it.
+- Switch to `/history`, then back to A.
+- The "shell already exists" code path re-runs `_injectSubAgentPanelInner` with a stale empty-agent payload.
+- Without the guard, the second injection clobbers the agent card.
+- With the guard, the script sees `activeCount=0 < previousActiveCount=1` inside the window and returns `state: 'anti-wipe-skip'` without touching the DOM.
+
+### 4. Pending-Injection Queue (`_pendingInjection`)
+
+Route or agent events arriving while a CDP call is inflight don't drop silently; they set `_pendingInjection = true`, and the inflight call's completion handler immediately fires one fresh injection with the latest data.
+
+### 5. Non-Conversation Route Short-Circuit
+
+The root (`/`) and `/history` routes don't have a sidebar or chatbox to inject into. The injector now exits early when the router reports no `cascadeId`, just resetting the per-route state — no futile `no-scroll-area` / `missing-inputbox` retry loop.
 
 ## Self-Retrying Injection Sections
 

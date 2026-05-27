@@ -5,6 +5,11 @@
 [![Release](https://github.com/abdofallah/Antigravity-Sub-Agents/actions/workflows/release.yml/badge.svg)](https://github.com/abdofallah/Antigravity-Sub-Agents/actions)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
+<!-- GitHub renders <video> on .md files; on other markdown viewers the link below acts as a fallback. -->
+<video src="https://github.com/abdofallah/Antigravity-Sub-Agents/raw/main/.github/antigravity%20subagents%20extension.mp4" controls width="100%" muted playsinline></video>
+
+> 🎬 [Watch the demo video](./.github/antigravity%20subagents%20extension.mp4) if it doesn't autoplay.
+
 ## Why?
 
 Alot of us are disappointed in the approach google has taken for 2.0... it could just have been as simple as this than a standalone manager and disconnected IDE.
@@ -22,6 +27,7 @@ Antigravity Sub-Agents is a VS Code extension that gives Antigravity IDE's AI ag
 - **📊 Real-Time Status** — Live status panel injected into the Agent Manager sidebar via CDP.
 - **🔒 Chat Locking** — Sub-agent chats are view-only; users interact through the parent.
 - **🔄 Auto-Delivery** — Results are automatically delivered to the parent when all agents finish.
+- **♻️ Restart Recovery** — Sub-agents that were running, waiting for approval, or completing during an extension/IDE restart are detected on next launch and restored to the correct state (Running / WaitingForAction / Completed / Cancelled) without any manual intervention.
 - **⏹ Cancel Control** — Stop individual agents, all agents, or silently terminate without reporting.
 - **🔌 MCP Integration** — Exposes tools via Model Context Protocol so agents can spawn sub-agents programmatically.
 - **⚙️ Configurable** — Default model, CDP port, auto-connect, auto-install settings.

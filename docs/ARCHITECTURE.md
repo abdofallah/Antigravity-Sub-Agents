@@ -135,13 +135,26 @@ Each sub-module defines a `*Context` interface (e.g., `LaunchContext`, `MonitorC
 
 **Polling Loop (`monitor.ts: pollProgress`):**
 
-Every 3 seconds, the monitor:
+Every 3 seconds (configurable via `subagents.progressPollInterval`), the monitor:
 1. Calls `listCascades()` to get all trajectory summaries.
 2. Diffs step counts to detect progress.
 3. Checks for `CASCADE_RUN_STATUS_IDLE` (completed turn).
 4. Detects waiting steps that need user action.
 5. Fires events for UI updates.
 6. Triggers batch delivery when all agents in a batch complete.
+
+**Restart Recovery (`orchestrator.ts: recoverLostAgents`):**
+
+On activation, every agent whose persisted status is `Failed` with the `LOST_TRACKING_ERROR` sentinel is re-checked against the LS:
+
+1. Phase 1 — `listCascades()` confirms the cascade still exists. Cascades missing on the LS side stay `Failed` with a clarified reason.
+2. Phase 2 — `getConversation(cascadeId)` is the authoritative source for `waitingSteps`, `requestedInteractions`, and full `stepCount`. Earlier revisions used only the summary endpoint, which never includes `waitingSteps`, and wrongly demoted `WaitingForAction` agents to `Completed`.
+3. Priority resolution:
+   - **P0:** Persisted `pendingAction` + no live `waitingSteps` + no step progress → `Cancelled` with `IDE_CANCELLED_ERROR` (native IDE behaviour: pending interactions are auto-cancelled on restart).
+   - **P1:** Any `waitingSteps` present → `WaitingForAction` and re-extract action details.
+   - **P2:** `CASCADE_RUN_STATUS_IDLE` + steps > 0 → silent `Completed` (no parent delivery, since this agent likely finished in a previous extension session).
+   - **Default:** Revive as `Running` and let the standing monitor disambiguate.
+4. The `messaging.checkBatchDelivery` short-circuits when every agent in a batch is `IDE_CANCELLED_ERROR` so the parent never sees a spurious "Report sent" message for work that never ran.
 
 ### 3. MCP Bridge (`mcp/`)
 
@@ -262,6 +275,9 @@ Central type definitions shared by all modules:
 - `IMessageBuffer`, `IBufferedMessage`, `IPendingAction`
 - Model constants (`AVAILABLE_MODELS`, `MODEL_NAMES`, `MODEL_LABELS`)
 - Status utilities (`isActiveStatus`, `isTerminalStatus`, `formatElapsed`)
+- **Sentinel constants:**
+  - `LOST_TRACKING_ERROR` — marker for agents that need recovery on next activation.
+  - `IDE_CANCELLED_ERROR` — marker for agents whose pending interaction was auto-cancelled by the IDE on its own restart; suppresses the spurious parent-delivery message.
 
 ## Data Flow
 

@@ -24,6 +24,22 @@ import {
     formatElapsed,
 } from './types';
 
+// ─── Trace logging ──────────────────────────────────────────────────────
+// Dedicated channel for diagnosing TreeView refresh issues. Off by default;
+// flip `subagents.debugLogging` to surface the per-event/per-refresh trace.
+let _treeOut: vscode.OutputChannel | null = null;
+function treeLog(msg: string): void {
+    try {
+        const enabled = vscode.workspace.getConfiguration('subagents').get<boolean>('debugLogging', false);
+        if (!enabled) return;
+        if (!_treeOut) {
+            _treeOut = vscode.window.createOutputChannel('Sub-Agents TreeView');
+            _treeOut.appendLine(`[${new Date().toISOString()}] === Sub-Agents TreeView trace channel started ===`);
+        }
+        _treeOut.appendLine(`[${new Date().toISOString()}] ${msg}`);
+    } catch { /* logging must never throw */ }
+}
+
 // ─── Status Data Interface ──────────────────────────────────────────────
 
 /** MCP server health status from the Language Server */
@@ -299,15 +315,28 @@ export class ActiveTreeProvider implements vscode.TreeDataProvider<vscode.TreeIt
     private readonly _onDidChangeTreeData = new vscode.EventEmitter<void>();
     readonly onDidChangeTreeData = this._onDidChangeTreeData.event;
     private _disposables: vscode.Disposable[] = [];
+    private _eventCount = 0;
+    private _refreshCount = 0;
+    private _getChildrenCount = 0;
 
     constructor(private readonly _orchestrator: Orchestrator) {
+        treeLog(`[ActiveTree] ctor — subscribing to orchestrator.onEvent (orchHasOnEvent=${typeof (_orchestrator as any)?.onEvent})`);
         // REALTIME: refresh on EVERY orchestrator event
         this._disposables.push(
-            this._orchestrator.onEvent(() => this.refresh()),
+            this._orchestrator.onEvent((ev) => {
+                this._eventCount++;
+                const agentId = ev?.agent?.id ? String(ev.agent.id).substring(0, 8) : 'unknown';
+                const status = ev?.agent?.status ?? '?';
+                treeLog(`[ActiveTree] event #${this._eventCount} type=${ev?.type} agent=${agentId} status=${status} -> refresh()`);
+                this.refresh();
+            }),
         );
+        treeLog(`[ActiveTree] ctor done — disposables=${this._disposables.length}`);
     }
 
     refresh(): void {
+        this._refreshCount++;
+        treeLog(`[ActiveTree] refresh #${this._refreshCount} — firing _onDidChangeTreeData`);
         this._onDidChangeTreeData.fire();
     }
 
@@ -316,6 +345,8 @@ export class ActiveTreeProvider implements vscode.TreeDataProvider<vscode.TreeIt
     }
 
     getChildren(element?: vscode.TreeItem): vscode.TreeItem[] {
+        this._getChildrenCount++;
+        const callTag = `[ActiveTree] getChildren #${this._getChildrenCount}`;
         if (!element) {
             // Root level: show batches that have active agents
             const batches = this._orchestrator.getBatches();
@@ -323,6 +354,16 @@ export class ActiveTreeProvider implements vscode.TreeDataProvider<vscode.TreeIt
                 const agents = this._orchestrator.getBatchAgents(b.id);
                 return agents.some(a => isActiveStatus(a.status));
             });
+
+            treeLog(`${callTag} (root) — totalBatches=${batches.length}, activeBatches=${activeBatches.length}`);
+            if (activeBatches.length === 0 && batches.length > 0) {
+                // Diagnostic: dump batch sizes/statuses when filter kicks everything out
+                for (const b of batches) {
+                    const agents = this._orchestrator.getBatchAgents(b.id);
+                    const states = agents.map(a => `${a.id.substring(0, 8)}=${a.status}`).join(',');
+                    treeLog(`${callTag}    batch ${b.id.substring(0, 8)} agents=[${states}]`);
+                }
+            }
 
             if (activeBatches.length === 0) {
                 // Show a placeholder
@@ -340,15 +381,18 @@ export class ActiveTreeProvider implements vscode.TreeDataProvider<vscode.TreeIt
 
         if (element instanceof BatchItem) {
             // Show sub-agents in this batch
-            return element.agents
+            const items = element.agents
                 .filter(a => isActiveStatus(a.status))
                 .map(a => new SubAgentItem(a));
+            treeLog(`${callTag} (batch ${element.batch.id.substring(0, 8)}) — ${items.length} active children`);
+            return items;
         }
 
         return [];
     }
 
     dispose(): void {
+        treeLog(`[ActiveTree] dispose — events=${this._eventCount}, refreshes=${this._refreshCount}, getChildren=${this._getChildrenCount}`);
         this._onDidChangeTreeData.dispose();
         for (const d of this._disposables) d.dispose();
     }
@@ -360,14 +404,27 @@ export class HistoryTreeProvider implements vscode.TreeDataProvider<vscode.TreeI
     private readonly _onDidChangeTreeData = new vscode.EventEmitter<void>();
     readonly onDidChangeTreeData = this._onDidChangeTreeData.event;
     private _disposables: vscode.Disposable[] = [];
+    private _eventCount = 0;
+    private _refreshCount = 0;
+    private _getChildrenCount = 0;
 
     constructor(private readonly _orchestrator: Orchestrator) {
+        treeLog(`[HistoryTree] ctor — subscribing to orchestrator.onEvent (orchHasOnEvent=${typeof (_orchestrator as any)?.onEvent})`);
         this._disposables.push(
-            this._orchestrator.onEvent(() => this.refresh()),
+            this._orchestrator.onEvent((ev) => {
+                this._eventCount++;
+                const agentId = ev?.agent?.id ? String(ev.agent.id).substring(0, 8) : 'unknown';
+                const status = ev?.agent?.status ?? '?';
+                treeLog(`[HistoryTree] event #${this._eventCount} type=${ev?.type} agent=${agentId} status=${status} -> refresh()`);
+                this.refresh();
+            }),
         );
+        treeLog(`[HistoryTree] ctor done — disposables=${this._disposables.length}`);
     }
 
     refresh(): void {
+        this._refreshCount++;
+        treeLog(`[HistoryTree] refresh #${this._refreshCount} — firing _onDidChangeTreeData`);
         this._onDidChangeTreeData.fire();
     }
 
@@ -376,8 +433,11 @@ export class HistoryTreeProvider implements vscode.TreeDataProvider<vscode.TreeI
     }
 
     getChildren(element?: vscode.TreeItem): vscode.TreeItem[] {
+        this._getChildrenCount++;
+        const callTag = `[HistoryTree] getChildren #${this._getChildrenCount}`;
         if (!element) {
             const history = this._orchestrator.getHistory();
+            treeLog(`${callTag} (root) — historyCount=${history.length}`);
             if (history.length === 0) {
                 const empty = new vscode.TreeItem('No history yet');
                 empty.iconPath = new vscode.ThemeIcon('history');
@@ -394,6 +454,7 @@ export class HistoryTreeProvider implements vscode.TreeDataProvider<vscode.TreeI
     }
 
     dispose(): void {
+        treeLog(`[HistoryTree] dispose — events=${this._eventCount}, refreshes=${this._refreshCount}, getChildren=${this._getChildrenCount}`);
         this._onDidChangeTreeData.dispose();
         for (const d of this._disposables) d.dispose();
     }

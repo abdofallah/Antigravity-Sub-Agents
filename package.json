@@ -2,7 +2,7 @@
     "name": "antigravity-subagents",
     "displayName": "Antigravity Sub-Agents",
     "description": "Launch, monitor, and orchestrate parallel sub-agents inside Antigravity v1",
-    "version": "0.6.0",
+    "version": "0.7.0",
     "publisher": "abdofallah",
     "engines": {
         "vscode": "^1.85.0"

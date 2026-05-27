@@ -78,6 +78,21 @@ export class CdpSidebarInjector implements vscode.Disposable {
     private _lastRouterConvoId: string = '';
     private _shellRetryTimer: NodeJS.Timeout | null = null;
     private _shellRetryCount = 0;
+    /** Incremented on every route change — stamps timer closures so stale ones self-discard */
+    private _routeGeneration = 0;
+    /** Set when a fresh injection was requested while one was already inflight */
+    private _pendingInjection = false;
+    /** High-water mark: active agent count from last successful injection for current route */
+    private _lastInjectedActiveCount = 0;
+    /** Timestamp of last successful injection with active agents */
+    private _lastInjectedAt = 0;
+    /**
+     * Strictly-monotonic injection sequence number. Stamped into every payload
+     * and used by the browser-side panel script to reject out-of-order CDP
+     * evaluations (Defense 1). Increments on EVERY _injectSubAgentPanelInner
+     * dispatch — never resets, even on route changes, to guarantee uniqueness.
+     */
+    private _injectSeq = 0;
     private _switching = false;
     private _injecting = false;
     private _parentTitleCache = new Map<string, string>();
@@ -105,10 +120,17 @@ export class CdpSidebarInjector implements vscode.Disposable {
      * Triggers an immediate DOM refresh when agent state changes.
      */
     private _onAgentEvent(): void {
+        logDebug('Agent event received');
         if (this._eventDebounceTimer) clearTimeout(this._eventDebounceTimer);
         // Cancel any pending retry — fresh data supersedes stale retry
         if (this._shellRetryTimer) { clearTimeout(this._shellRetryTimer); this._shellRetryTimer = null; }
+        // Skip injection on non-conversation routes (root '/', '/history', etc.)
+        // — there's no sidebar or chatbox to inject into on these pages
+        if (!this._lastRouterConvoId) return;
+        // Stamp with generation so stale debounce from a previous route self-discards
+        const eventGen = this._routeGeneration;
         this._eventDebounceTimer = setTimeout(() => {
+            if (this._routeGeneration !== eventGen) return; // Route changed — discard
             this._lastDataHash = ''; // Force rebuild
             this._shellRetryCount = 0; // Reset retries on new data
             if (this._connected) this.injectSubAgentPanel();
@@ -412,11 +434,35 @@ export class CdpSidebarInjector implements vscode.Disposable {
     private _onRouterChange(convoId: string | null): void {
         const id = convoId || '';
         if (id === this._lastRouterConvoId) return;
+        log(`ROUTE CHANGED -> convo=${id ? id.substring(0, 8) : 'none'} | lastConvoId=${this._lastRouterConvoId ? this._lastRouterConvoId.substring(0, 8) : 'none'} `);
         this._lastRouterConvoId = id;
-        log(`ROUTE CHANGED -> convo=${id ? id.substring(0, 8) : 'none'}`);
         this._lastDataHash = '';
-        this._shellRetryCount = 0; // Reset retries on route change
+        this._shellRetryCount = 0;
+        // Bump generation — any inflight or queued retry closures will see the mismatch
+        // and self-discard, so stale results from the previous route can't pollute this one
+        this._routeGeneration++;
+        this._pendingInjection = false; // Clear any queued work from the previous route
+        // Reset high-water mark for the new route
+        this._lastInjectedActiveCount = 0;
+        this._lastInjectedAt = 0;
+        // Kill ALL pending timers from the previous route context.
+        // The graduated-retry chain (1.5s/4s/8s) lives in _refreshTimers — those
+        // closures would also fire on the new route if not cleared. The generation
+        // guard inside the timer callbacks would discard the result, but it's
+        // cleaner to cancel the timers outright.
         if (this._shellRetryTimer) { clearTimeout(this._shellRetryTimer); this._shellRetryTimer = null; }
+        if (this._eventDebounceTimer) { clearTimeout(this._eventDebounceTimer); this._eventDebounceTimer = null; }
+        for (const t of this._refreshTimers) clearTimeout(t);
+        this._refreshTimers = [];
+
+        // Non-conversation routes (root '/', '/history', empty) — just clean up, don't inject.
+        // There's no sidebar or chatbox on these pages so injection always fails with
+        // 'no-scroll-area' / 'missing-inputbox' and enters a futile retry loop.
+        if (!id) {
+            logDebug('Non-conversation route — skipping injection');
+            return;
+        }
+
         if (this._connected) {
             this.injectSubAgentPanel();
         }
@@ -425,30 +471,73 @@ export class CdpSidebarInjector implements vscode.Disposable {
     // ─── Main Injection ───────────────────────────────────────────────
 
     async injectSubAgentPanel(): Promise<void> {
+        logDebug('injectSubAgentPanel called');
         if (!this._connected || !this._ws) return;
-        // Mutex: prevent concurrent injections from racing
-        if (this._injecting) return;
+        if (this._injecting) {
+            // A route change or agent event arrived while a CDP call was in flight.
+            // Queue one follow-up run so the request is never silently dropped.
+            this._pendingInjection = true;
+            return;
+        }
         this._injecting = true;
         try {
             await this._injectSubAgentPanelInner();
         } finally {
             this._injecting = false;
+            // Execute the queued injection immediately after (with fresh data)
+            if (this._pendingInjection) {
+                this._pendingInjection = false;
+                this._lastDataHash = '';
+                this.injectSubAgentPanel();
+            }
         }
     }
 
     private async _injectSubAgentPanelInner(): Promise<void> {
+        logDebug('_injectSubAgentPanelInner called');
         if (!this._connected || !this._ws) return;
+
+        // Capture generation BEFORE any async work — if a route change occurs
+        // while a CDP call is in-flight, the result belongs to a stale route
+        // and must be discarded entirely to prevent false-positive retries.
+        const callGeneration = this._routeGeneration;
 
         if (!this._cssInjected) {
             await this._injectCSS();
         }
+        if (this._routeGeneration !== callGeneration) return; // Route changed during CSS injection
 
         if (!this._routerSubscribed) {
             await this._setupRouterSubscription();
         }
+        if (this._routeGeneration !== callGeneration) return; // Route changed during router setup
 
         const agents = this._orchestrator.getAll();
         const VISIBLE_LIMIT = 5;
+
+        // High-water mark guard: if we previously injected active agents for this route
+        // but the orchestrator transiently shows 0 (monitor polling oscillation),
+        // suppress the injection to prevent UI flicker. Allow through after 2s for
+        // genuine completions or if no active convo is tracked.
+        if (this._lastRouterConvoId && this._lastInjectedActiveCount > 0) {
+            logDebug(`High-water check: activeCount=${this._lastInjectedActiveCount}, elapsed=${Date.now() - this._lastInjectedAt}ms`);
+            const activeForRoute = agents.filter(a =>
+                isActiveStatus(a.status) && a.parentId === this._lastRouterConvoId
+            ).length;
+            if (activeForRoute === 0 && (Date.now() - this._lastInjectedAt) < 2000) {
+                logDebug(`Suppressed 0-agent injection (high-water=${this._lastInjectedActiveCount}, elapsed=${Date.now() - this._lastInjectedAt}ms)`);
+                // Schedule a verification retry after the oscillation settles
+                if (!this._shellRetryTimer) {
+                    const gen = this._routeGeneration;
+                    this._shellRetryTimer = setTimeout(() => {
+                        if (this._routeGeneration !== gen) return;
+                        this._lastDataHash = '';
+                        this.injectSubAgentPanel();
+                    }, 500);
+                }
+                return;
+            }
+        }
 
         const agentData: AgentUIData[] = agents.map(agent => ({
             id: agent.id,
@@ -517,6 +606,20 @@ export class CdpSidebarInjector implements vscode.Disposable {
             parentTitles[pid] = this._parentTitleCache.get(pid) || 'Parent Chat';
         }
 
+        // Defense 3: diagnostic — capture orchestrator snapshot state at the EXACT
+        // moment this payload is built. Compare against expected counts in the logs
+        // to identify which code path captured a stale snapshot.
+        const allIds = agents.map(a => a.id);
+        const lastIds = allIds.slice(-3).map(id => id.substring(0, 8)).join(',');
+        const activeIds = agents.filter(a => isActiveStatus(a.status))
+            .map(a => `${a.id.substring(0, 8)}:${a.status}:${a.parentId.substring(0, 8)}`)
+            .join('|');
+
+        // Allocate the next monotonic sequence number. CRUCIALLY done HERE — right
+        // before serialization — so the sequence reflects the actual order in
+        // which payloads are committed to CDP, not the order of method entry.
+        const injectSeq = ++this._injectSeq;
+
         // Build injection script using modular builder
         const injectionData: PanelInjectionData = {
             prefix: P,
@@ -529,7 +632,21 @@ export class CdpSidebarInjector implements vscode.Disposable {
             parentTitles,
             uiPollInterval: getUiPollInterval(),
             debugLogging: getDebugLogging(),
+            // Stamp the payload with Node's expected route context. The browser
+            // script uses this as a strict guard: if the router's resolved
+            // cascadeId doesn't match expectedConvoId, the injection aborts
+            // WITHOUT mutating the DOM — preventing transient router-state
+            // misses (e.g. during the shell-created retry after navigating
+            // back from '/' or '/history') from wiping a freshly-rendered panel.
+            expectedConvoId: this._lastRouterConvoId,
+            routeGeneration: callGeneration,
+            // Defense 1: monotonic sequence number. Browser rejects any
+            // evaluation with seq < last accepted seq for the same convo.
+            dataSequence: injectSeq,
         };
+        // Defense 3 diagnostic log — emitted unconditionally (not gated by debug)
+        // so we can correlate stale snapshots to their construction point.
+        log(`PAYLOAD#${injectSeq} expected=${this._lastRouterConvoId ? this._lastRouterConvoId.substring(0, 8) : 'none'} gen=${callGeneration} | allAgents=${allIds.length} lastIds=[${lastIds}] active=[${activeIds || 'none'}]`);
 
         const script = buildPanelScript(injectionData);
 
@@ -538,6 +655,16 @@ export class CdpSidebarInjector implements vscode.Disposable {
                 expression: script,
                 returnByValue: true,
             });
+            logDebug(`CDP evaluation completed for script: ${result}`);
+
+            // ══ CRITICAL: Discard stale result if route changed during CDP call ══
+            // Without this guard, retries scheduled from the stale result would capture
+            // the NEW _routeGeneration (already bumped by _onRouterChange), making the
+            // generation check in the retry closure useless — the core race condition.
+            if (this._routeGeneration !== callGeneration) {
+                logDebug(`Discarding stale CDP result (gen ${callGeneration} → ${this._routeGeneration})`);
+                return;
+            }
 
             const val = result?.result?.value;
 
@@ -554,47 +681,91 @@ export class CdpSidebarInjector implements vscode.Disposable {
             const d = res.debug || {};
             const stateKey = `${res.state}|${d.activeConvoId}`;
 
+            // Defense 1/2 diagnostic: log when the browser guards rejected our
+            // payload. This tells us EXACTLY when a stale snapshot would have
+            // wiped the panel — invaluable for tracking down the underlying race.
+            if (res.state === 'guard-skip' && d.guard) {
+                log(`GUARD-SKIP#${injectSeq} reason=${d.guard} expected=${this._lastRouterConvoId ? this._lastRouterConvoId.substring(0, 8) : 'none'} browser=${d.activeConvoId} (panel preserved)`);
+            }
+
+            // Update high-water mark on successful injection with active agents
+            const injectedActive = typeof res.activeCount === 'number' ? res.activeCount : 0;
+            if (injectedActive > 0) {
+                this._lastInjectedActiveCount = injectedActive;
+                this._lastInjectedAt = Date.now();
+            }
+
             // Log meaningful state changes only
             if (stateKey !== this._lastState) {
-                const convoStr = d.activeConvoId || 'none';
-                if (res.state === 'updated') {
-                    log(`UPDATED: ${d.filteredCount}/${d.totalAgentsInStore} agents for convo=${convoStr} (${res.activeCount} active) | agents=[${d.agentIds}]${d.createdShell ? ' [shell created]' : ''}`);
-                } else if (res.state === 'empty') {
-                    log(`EMPTY: convo=${convoStr}`);
-                } else if (!res.ok) {
-                    log(`ERROR: ${res.reason}`);
-                }
-                this._lastState = stateKey;
+                logDebug(`State changed to: ${stateKey}, from ${this._lastState}`);
+            }
 
-                // Dump trace from browser-side script
-                if (d.trace && d.trace.length > 0) {
-                    for (const t of d.trace) {
-                        logDebug(`  ↳ ${t}`);
-                    }
+            const convoStr = d.activeConvoId || 'none';
+            if (res.state === 'updated') {
+                log(`UPDATED#${injectSeq}: ${d.filteredCount}/${d.totalAgentsInStore} agents for convo=${convoStr} (${res.activeCount} active) | agents=[${d.agentIds}]${d.createdShell ? ' [shell created]' : ''}`);
+            } else if (res.state === 'empty') {
+                log(`EMPTY#${injectSeq}: convo=${convoStr}`);
+            } else if (!res.ok) {
+                log(`ERROR#${injectSeq}: ${res.reason}`);
+            }
+            this._lastState = stateKey;
+
+            // Dump trace from browser-side script
+            if (d.trace && d.trace.length > 0) {
+                for (const t of d.trace) {
+                    logDebug(`  ↳ ${t}`);
                 }
             }
 
-            // Per-section retry: if any section is incomplete, schedule a retry
+            // Per-section retry: if any section is incomplete, schedule a retry.
+            // Only retry for missing-inputbox when there are active agents that
+            // actually need the chatbox dropdown. On sub-agent pages (archived chats),
+            // the inputBox is replaced by the archive banner and will never appear —
+            // retrying there with 0 active agents is futile and causes an infinite loop.
             const sections = res.sections || {};
             const needsRetry =
                 sections.sidebar === 'no-scroll-area' ||
-                sections.chatbox === 'missing-inputbox';
+                (sections.chatbox === 'missing-inputbox' && injectedActive > 0);
 
-            // Don't retry if the right panel itself is missing — sidebar is closed by the user
+            // rpMissing = right panel container not found. This can mean:
+            //   a) Sidebar is genuinely closed by user (don't retry forever)
+            //   b) Page is still loading after navigation (must retry)
+            // Allow retries during the initial window (first 20 attempts ≈ 6s)
+            // to cover case (b), then stop to avoid wasting cycles on case (a).
             const rpMissing = d.trace?.some((t: string) => t.includes('rp=missing'));
+            const RP_MISSING_RETRY_LIMIT_LOGS = 3;
 
             if (needsRetry && !rpMissing) {
                 this._shellRetryCount++;
-                // Throttle logs: first 5, then every 10th
-                if (this._shellRetryCount <= 5 || this._shellRetryCount % 10 === 0) {
-                    logDebug(`Scheduling retry ${this._shellRetryCount} (sidebar=${sections.sidebar}, chatbox=${sections.chatbox})`);
+                if (this._shellRetryCount > RP_MISSING_RETRY_LIMIT_LOGS && this._shellRetryCount % 10 === 0) {
+                    logDebug(`Scheduling retry ${this._shellRetryCount} (sidebar=${sections.sidebar}, chatbox=${sections.chatbox}${rpMissing ? ', rp=missing' : ''})`);
                 }
                 if (this._shellRetryTimer) clearTimeout(this._shellRetryTimer);
+                // Stamp with current generation — if route changes before this fires,
+                // the mismatch causes it to self-discard rather than inject stale data
+                const retryGen = this._routeGeneration;
                 this._shellRetryTimer = setTimeout(() => {
-                    this._lastState = ''; // Force log on next attempt
+                    if (this._routeGeneration !== retryGen) return; // Route changed — discard
+                    this._lastState = '';
                     this._lastDataHash = '';
                     this.injectSubAgentPanel();
                 }, 300);
+            }
+
+            // When the sidebar shell was just created, the data may be stale
+            // (the orchestrator event that triggered this injection may have
+            // arrived before the DOM was ready). Schedule a follow-up refresh
+            // with fresh orchestrator data to ensure correct counts.
+            if (d.createdShell) {
+                logDebug('Shell just created — scheduling data refresh');
+                if (this._shellRetryTimer) clearTimeout(this._shellRetryTimer);
+                const shellGen = this._routeGeneration;
+                this._shellRetryTimer = setTimeout(() => {
+                    if (this._routeGeneration !== shellGen) return; // Route changed — discard
+                    this._lastState = '';
+                    this._lastDataHash = '';
+                    this.injectSubAgentPanel();
+                }, 500);
             }
 
         } catch (err: any) {

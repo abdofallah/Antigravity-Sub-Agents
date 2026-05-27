@@ -137,7 +137,7 @@ export function buildChatboxUI(): string {
 
                         // Stop button overlay: visible on hover, fades in from the right
                         var stopOverlay = el('div', '');
-                        stopOverlay.style.cssText = 'position:absolute;top:0;bottom:0;right:0;padding-left:12px;display:flex;align-items:center;justify-content:flex-end;gap:1px;transform:translateX(6px);visibility:hidden;background:linear-gradient(to right, transparent 0%, var(--card-border,rgba(18,18,18,0.95)) 25%);';
+                        stopOverlay.style.cssText = 'position: absolute; top: 0px; bottom: 0px; right: 0px; padding-left: 12px; display: flex; align-items: center; justify-content: flex-end; gap: 1px; transform: translateX(6px); visibility: hidden; background: linear-gradient(to right, transparent 0%, var(--card-border,rgba(18,18,18,0.95)) 65%); width: 70%; border-radius: 20px;';
 
                         var stopBtnEl = el('button', '');
                         stopBtnEl.style.cssText = 'width:24px;height:24px;display:flex;align-items:center;justify-content:center;border-radius:6px;border:none;background:none;cursor:pointer;padding:0;margin-right:2px;';
