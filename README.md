@@ -6,7 +6,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 <!-- GitHub renders <video> on .md files; on other markdown viewers the link below acts as a fallback. -->
-<video src="https://github.com/abdofallah/Antigravity-Sub-Agents/raw/main/.github/antigravity%20subagents%20extension.mp4" controls width="100%"></video>
+<video src="https://private-user-images.githubusercontent.com/38984510/598565132-92d56915-0090-4067-8044-310256ad8ba3.mp4" controls width="100%"></video>
 
 > 🎬 [Watch the demo video](./.github/antigravity%20subagents%20extension.mp4) if it doesn't autoplay.
 
